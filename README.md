@@ -100,8 +100,11 @@ New registrations remain inactive until the six-digit email verification code is
 ```powershell
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_USER=your-sender@gmail.com
 SMTP_EMAIL=your-sender@gmail.com
 SMTP_PASSWORD=your-gmail-app-password
+SMTP_FROM_EMAIL=your-sender@gmail.com
 EMAIL_VERIFICATION_EXPIRY_MINUTES=10
 EMAIL_VERIFICATION_SECRET=generate-a-long-random-secret
 PASSWORD_RESET_EXPIRY_MINUTES=20
@@ -110,7 +113,7 @@ APP_URL=http://localhost:5173
 CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 ```
 
-For Gmail, use an App Password rather than the normal account password. If SMTP is not configured, registration returns an email-delivery error and does not create an account. Existing demo accounts are treated as verified; new users cannot sign in until verification succeeds.
+For Gmail, use an App Password rather than the normal account password. `SMTP_USER` and `SMTP_FROM_EMAIL` are preferred; the legacy `SMTP_EMAIL` variable remains supported. Use `SMTP_SECURE=true` with port 465 and `SMTP_SECURE=false` with port 587. If SMTP is not configured or delivery fails, registration returns an explicit error and does not create an account. Existing demo accounts are treated as verified; new users cannot sign in until verification succeeds.
 
 ## User data isolation
 

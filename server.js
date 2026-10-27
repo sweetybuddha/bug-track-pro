@@ -106,6 +106,42 @@ const verificationExpiryMinutes = Math.max(1, Number(process.env.EMAIL_VERIFICAT
 const verificationPepper = process.env.EMAIL_VERIFICATION_SECRET || crypto.randomBytes(32).toString('hex');
 const passwordResetExpiryMinutes = Math.min(30, Math.max(15, Number(process.env.PASSWORD_RESET_EXPIRY_MINUTES || 20)));
 const passwordResetRequests = new Map();
+class SmtpConfigurationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SmtpConfigurationError';
+    this.code = 'SMTP_NOT_CONFIGURED';
+  }
+}
+class SmtpDeliveryError extends Error {
+  constructor(cause) {
+    super('The SMTP server could not deliver the email.');
+    this.name = 'SmtpDeliveryError';
+    this.code = 'SMTP_DELIVERY_FAILED';
+    this.cause = cause;
+  }
+}
+const smtpConfig = () => {
+  const host = process.env.SMTP_HOST?.trim();
+  const port = Number(process.env.SMTP_PORT || 587);
+  const user = (process.env.SMTP_USER || process.env.SMTP_EMAIL)?.trim();
+  const password = process.env.SMTP_PASSWORD;
+  const from = (process.env.SMTP_FROM_EMAIL || process.env.SMTP_EMAIL || user)?.trim();
+  const secure = String(process.env.SMTP_SECURE || (port === 465)).toLowerCase() === 'true';
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535 || !user || !password || !from) {
+    throw new SmtpConfigurationError('Email delivery is not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and SMTP_FROM_EMAIL.');
+  }
+  return { host, port, secure, user, password, from };
+};
+const createSmtpTransporter = () => {
+  const config = smtpConfig();
+  return nodemailer.createTransport({
+    host: config.host,
+    port: config.port,
+    secure: config.secure,
+    auth: { user: config.user, pass: config.password },
+  });
+};
 const hashOtp = (email, otp) => crypto.createHash('sha256').update(`${verificationPepper}:${email}:${otp}`).digest('hex');
 const hashResetToken = (token) => crypto.createHash('sha256').update(`${verificationPepper}:reset:${token}`).digest('hex');
 const passwordHash = (password) => {
@@ -143,42 +179,34 @@ const maskEmail = (email) => {
   return `${local.slice(0, 2)}${'*'.repeat(Math.max(1, local.length - 2))}@${domain}`;
 };
 const sendVerificationEmail = async (email, code) => {
-  const { SMTP_HOST, SMTP_PORT, SMTP_EMAIL, SMTP_PASSWORD } = process.env;
-  if (!SMTP_HOST || !SMTP_PORT || !SMTP_EMAIL || !SMTP_PASSWORD) {
-    throw new Error('Email delivery is not configured. Set SMTP_HOST, SMTP_PORT, SMTP_EMAIL, and SMTP_PASSWORD.');
+  const config = smtpConfig();
+  const transporter = createSmtpTransporter();
+  try {
+    await transporter.sendMail({
+      from: config.from,
+      to: email,
+      subject: 'Verify your BugTrack Pro email',
+      text: `Your BugTrack Pro verification code is ${code}. It expires in ${verificationExpiryMinutes} minutes.`,
+    });
+  } catch (error) {
+    throw new SmtpDeliveryError(error);
   }
-  const transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT),
-    secure: false,
-    auth: { user: SMTP_EMAIL, pass: SMTP_PASSWORD },
-  });
-  await transporter.sendMail({
-    from: SMTP_EMAIL,
-    to: email,
-    subject: 'Verify your BugTrack Pro email',
-    text: `Your BugTrack Pro verification code is ${code}. It expires in ${verificationExpiryMinutes} minutes.`,
-  });
 };
 const sendPasswordResetEmail = async (email, token) => {
-  const { SMTP_HOST, SMTP_PORT, SMTP_EMAIL, SMTP_PASSWORD } = process.env;
-  if (!SMTP_HOST || !SMTP_PORT || !SMTP_EMAIL || !SMTP_PASSWORD) {
-    throw new Error('Email delivery is not configured.');
-  }
-  const transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT),
-    secure: false,
-    auth: { user: SMTP_EMAIL, pass: SMTP_PASSWORD },
-  });
+  const config = smtpConfig();
+  const transporter = createSmtpTransporter();
   const resetBaseUrl = process.env.APP_URL || 'http://localhost:5173';
   const resetUrl = `${resetBaseUrl.replace(/\/$/, '')}/?resetToken=${encodeURIComponent(token)}`;
-  await transporter.sendMail({
-    from: SMTP_EMAIL,
-    to: email,
-    subject: 'Reset your BugTrack Pro password',
-    text: `Use this link to reset your BugTrack Pro password. It expires in ${passwordResetExpiryMinutes} minutes:\n\n${resetUrl}\n\nIf you did not request this, you can ignore this email.`,
-  });
+  try {
+    await transporter.sendMail({
+      from: config.from,
+      to: email,
+      subject: 'Reset your BugTrack Pro password',
+      text: `Use this link to reset your BugTrack Pro password. It expires in ${passwordResetExpiryMinutes} minutes:\n\n${resetUrl}\n\nIf you did not request this, you can ignore this email.`,
+    });
+  } catch (error) {
+    throw new SmtpDeliveryError(error);
+  }
 };
 if (db.data.bugs.some((bug) => bug.is_demo) || db.data.test_cases.some((testCase) => testCase.is_demo)) {
   db.data.bugs = db.data.bugs.filter((bug) => !bug.is_demo);
@@ -249,7 +277,11 @@ app.post('/api/password-reset/request', async (req, res) => {
     delete user.passwordResetTokenHash;
     delete user.passwordResetExpiresAt;
     await save();
-    console.error('Password reset email delivery failed.');
+    console.error('Password reset email delivery failed:', error.code || error.message);
+    if (error.code === 'SMTP_NOT_CONFIGURED') {
+      return res.status(503).json({ error: 'Password reset email is not configured on the server.', code: error.code });
+    }
+    return res.status(503).json({ error: 'The password reset email could not be delivered. Check the SMTP settings and try again.', code: error.code });
   }
   res.status(202).json(genericResponse);
 });
@@ -294,8 +326,11 @@ app.post('/api/register', async (req, res) => {
   } catch (error) {
     db.data.users = db.data.users.filter((candidate) => candidate !== user);
     await save();
-    console.error('Verification email delivery failed:', error.message);
-    return res.status(503).json({ error: 'We could not send the verification email. Check the email service configuration and try again.' });
+    console.error('Verification email delivery failed:', error.code || error.message);
+    if (error.code === 'SMTP_NOT_CONFIGURED') {
+      return res.status(503).json({ error: 'Verification email is not configured on the server.', code: error.code });
+    }
+    return res.status(503).json({ error: 'The verification email could not be delivered. Check the SMTP settings and try again.', code: error.code });
   }
   res.status(202).json({ verificationRequired: true, email: user.email, maskedEmail: maskEmail(user.email), expiresAt: user.verificationExpiresAt });
 });
@@ -340,8 +375,11 @@ app.post('/api/verify/resend', async (req, res) => {
     await save();
     res.json({ sent: true, expiresAt: user.verificationExpiresAt, maskedEmail: maskEmail(email) });
   } catch (error) {
-    console.error('Verification resend failed:', error.message);
-    res.status(503).json({ error: 'We could not resend the verification email. Please try again later.' });
+    console.error('Verification resend failed:', error.code || error.message);
+    if (error.code === 'SMTP_NOT_CONFIGURED') {
+      return res.status(503).json({ error: 'Verification email is not configured on the server.', code: error.code });
+    }
+    res.status(503).json({ error: 'The verification email could not be delivered. Check the SMTP settings and try again.', code: error.code });
   }
 });
 if (!db.data.bugs.length) {

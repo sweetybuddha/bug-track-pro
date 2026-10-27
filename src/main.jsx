@@ -10,8 +10,8 @@ const api = async (url, options = {}) => {
   try {
     response = await fetch(url, { ...options, credentials: 'same-origin', signal: controller.signal });
   } catch (error) {
-    if (error.name === 'AbortError') throw new Error('The request timed out while waiting for the analyzer. Check that the analyzer service is running and try again.');
-    throw new Error('Cannot connect to the application server. Run npm run dev and try again.');
+    if (error.name === 'AbortError') throw new Error('The request timed out. Check the server logs and try again.');
+    throw new Error('Cannot connect to the application server. Start the backend and try again.');
   } finally {
     clearTimeout(timeout);
   }
@@ -88,7 +88,7 @@ function Login({ onLogin }) {
     try {
       const result = await api(mode === 'login' ? '/api/login' : '/api/register', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(mode === 'login' ? {email,password} : {name,email,password,role}) });
       if (mode === 'register') { setPendingEmail(result.email); setMaskedEmail(result.maskedEmail); setExpiresAt(result.expiresAt); setCountdown(Math.ceil((result.expiresAt - Date.now()) / 1000)); setCode(''); setMode('verify'); setError(''); } else onLogin(result);
-    } catch (loginError) { setError(loginError.message.includes('Request failed (500)') ? 'Registration is temporarily unavailable. Start the API server and configure SMTP email delivery.' : loginError.message); } finally { setLoading(false); }
+    } catch (loginError) { setError(loginError.message); } finally { setLoading(false); }
   };
   const resend = async () => { setError(''); try { const result = await api('/api/verify/resend', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:pendingEmail}) }); setExpiresAt(result.expiresAt); setCountdown(Math.ceil((result.expiresAt - Date.now()) / 1000)); setError('A new verification code was sent.'); } catch (resendError) { setError(resendError.message); } };
   const verificationPage = <><div className="brand-mark"><Bug size={22}/></div><h1>Verify Your Email</h1><p className="muted">We have sent a verification code to your email address.</p><p className="muted">{maskedEmail}</p><label>Six-digit verification code<input value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,'').slice(0,6))} inputMode="numeric" pattern="[0-9]{6}" autoComplete="one-time-code" placeholder="000000" required/></label>{error&&<div className={error.includes('successfully')||error.includes('sent')?'login-success':'login-error'}>{error}</div>}<button className="primary full" disabled={loading||code.length!==6}>{loading?'Verifying...':'Verify Email'}</button><button type="button" className="auth-switch" onClick={resend} disabled={loading||countdown>0}>Resend OTP {countdown>0&&`(${Math.floor(countdown/60)}:${String(countdown%60).padStart(2,'0')})`}</button><button type="button" className="auth-switch" onClick={()=>{setMode('register');setError('')}}>Back to Registration</button></>;
