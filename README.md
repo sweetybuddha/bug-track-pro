@@ -24,6 +24,33 @@ npm run dev
 
 Open `http://localhost:5173`. The React app runs on port 5173, the existing management API on port 3000, and the Flask analyzer on port 5000.
 
+## Deploy on Render
+
+This project can run as one Render web service. Create a new **Web Service** from
+the repository and use:
+
+- **Build command:** `npm ci && pip install -r backend/requirements.txt && npm run build`
+- **Start command:** `npm run start:prod`
+- **Health check path:** `/api/health`
+
+Add the variables from your local `.env` in Render's Environment settings. Do not
+commit `.env`; enter SMTP credentials, `EMAIL_VERIFICATION_SECRET`, and any API
+keys directly in the hosting provider. Also set:
+
+```text
+APP_URL=https://your-service.onrender.com
+CORS_ORIGINS=https://your-service.onrender.com
+```
+
+The service uses the host-provided `PORT` and starts the analyzer on an internal
+port. If you use a separate analyzer service instead, set `ANALYZER_URL` on the
+Node service to that service's private URL.
+
+The default JSON and SQLite files are local files. Attach persistent storage (or
+move these data stores to a managed database/object store) before relying on
+the deployment for production data; otherwise a service restart or redeploy can
+lose uploaded files and application data.
+
 Run analyzer tests:
 
 ```powershell
