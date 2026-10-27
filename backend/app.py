@@ -15,7 +15,7 @@ from flask import Flask, jsonify, request, send_file
 from werkzeug.utils import secure_filename
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
+DATA = Path(os.environ.get("VERCEL_DATA_DIR", str(ROOT / "data")))
 UPLOADS = DATA / "uploads"
 WORKSPACES = DATA / "workspaces"
 DATABASE = DATA / "analyzer.sqlite3"

@@ -8,11 +8,14 @@ import { JSONFilePreset } from 'lowdb/node';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import nodemailer from 'nodemailer';
+import os from 'os';
 
 dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const app = express(); const uploadDir = path.join(__dirname, 'uploads');
+const runtimeDataDir = process.env.VERCEL === '1' ? path.join(os.tmpdir(), 'bugtrack-pro') : __dirname;
+fs.mkdirSync(runtimeDataDir, { recursive: true });
+const app = express(); const uploadDir = path.join(runtimeDataDir, 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 const upload = multer({ dest: uploadDir, limits: { fileSize: 5 * 1024 * 1024 } });
 const analyzerUrl = process.env.ANALYZER_URL || 'http://127.0.0.1:5000';
@@ -81,7 +84,12 @@ app.post('/api/analyzer/analyze', requireAuth, async (req, res) => {
     clearTimeout(timeout);
   }
 });
-const db = await JSONFilePreset(path.join(__dirname, 'bugtrack.json'), { bugs: [], comments: [], activity: [], test_cases: [], users: [], nextBug: 1042, nextCase: 2001 });
+const seedDatabasePath = path.join(__dirname, 'bugtrack.json');
+const databasePath = path.join(runtimeDataDir, 'bugtrack.json');
+if (databasePath !== seedDatabasePath && !fs.existsSync(databasePath) && fs.existsSync(seedDatabasePath)) {
+  fs.copyFileSync(seedDatabasePath, databasePath);
+}
+const db = await JSONFilePreset(databasePath, { bugs: [], comments: [], activity: [], test_cases: [], users: [], nextBug: 1042, nextCase: 2001 });
 db.data.comments ||= [];
 db.data.activity ||= [];
 db.data.users ||= [];
