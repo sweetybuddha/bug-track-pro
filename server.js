@@ -28,9 +28,14 @@ app.use(cors({
 app.use(express.json()); app.use('/uploads', express.static(uploadDir));
 const sessionSecret = process.env.SESSION_SECRET || process.env.EMAIL_VERIFICATION_SECRET || crypto.randomBytes(32).toString('hex');
 const sessionLifetimeSeconds = 24 * 60 * 60;
-const parseCookies = (header = '') => Object.fromEntries(header.split(';').filter(Boolean).map(part => {
+const parseCookies = (header = '') => Object.fromEntries(header.split(';').filter(Boolean).flatMap(part => {
   const index = part.indexOf('=');
-  return [part.slice(0, index).trim(), decodeURIComponent(part.slice(index + 1).trim())];
+  if (index < 0) return [];
+  try {
+    return [[part.slice(0, index).trim(), decodeURIComponent(part.slice(index + 1).trim())]];
+  } catch {
+    return [];
+  }
 }));
 const signSession = (userId) => {
   const payload = Buffer.from(JSON.stringify({ userId, expiresAt: Date.now() + sessionLifetimeSeconds * 1000 })).toString('base64url');
@@ -51,9 +56,13 @@ const readSession = (value) => {
   }
 };
 const requireAuth = (req, res, next) => {
-  const session = readSession(parseCookies(req.headers.cookie).bugtrack_session || '');
+  const sessionCookie = parseCookies(req.headers.cookie).bugtrack_session || '';
+  const session = readSession(sessionCookie);
   const user = session && db.data.users.find(candidate => candidate.id === session.userId);
-  if (!user) return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
+  if (!user) {
+    console.warn('Protected request rejected: invalid or expired session.', req.method, req.originalUrl);
+    return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
+  }
   req.user = user;
   next();
 };
