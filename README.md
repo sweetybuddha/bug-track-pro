@@ -51,6 +51,25 @@ move these data stores to a managed database/object store) before relying on
 the deployment for production data; otherwise a service restart or redeploy can
 lose uploaded files and application data.
 
+## Deploy on Vercel
+
+The repository is configured as three Vercel services:
+
+- `app` serves the Vite frontend.
+- `api` serves the Express application at `/api/*`.
+- `analyzer` runs the Flask analyzer internally.
+
+The `api` service receives the analyzer's internal URL through the
+`ANALYZER_URL` service binding. Do not set `ANALYZER_URL` manually in Vercel.
+Import the repository as a Vercel project and deploy with the defaults from
+`vercel.json`. Add the environment variables from `.env` in the Vercel project
+settings, along with `APP_URL` set to the deployed domain and
+`CORS_ORIGINS` set to that same domain.
+
+Vercel functions have temporary filesystems. Move `bugtrack.json`, analyzer
+SQLite data, and uploads to durable managed storage before using this
+deployment for production data.
+
 Run analyzer tests:
 
 ```powershell

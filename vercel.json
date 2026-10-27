@@ -1,0 +1,40 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "app": {
+      "root": ".",
+      "framework": "vite"
+    },
+    "api": {
+      "root": ".",
+      "runtime": "nodejs20.x",
+      "entrypoint": "api/index.js",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "analyzer",
+          "format": "url",
+          "env": "ANALYZER_URL"
+        }
+      ]
+    },
+    "analyzer": {
+      "root": "backend",
+      "framework": "flask"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": {
+        "service": "api"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "app"
+      }
+    }
+  ]
+}

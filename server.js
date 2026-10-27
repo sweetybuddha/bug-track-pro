@@ -453,4 +453,8 @@ app.post('/api/uploads',requireAuth,upload.single('file'),(req,res)=>{if(!req.fi
 app.get('/api/export',requireAuth,(req,res)=>{const rows=db.data.bugs.filter(b=>b.user_id===req.user.id).map(b=>[b.bug_key,b.title,b.module,b.severity,b.priority,b.status,b.assignee,b.created_at].map(v=>`"${String(v).replaceAll('"','""')}"`).join(','));res.type('text/csv').set('Content-Disposition','attachment; filename="bugtrack-report.csv"').send(['Bug ID,Title,Module,Severity,Priority,Status,Assignee,Created',...rows].join('\n'))});
 app.use(express.static(path.join(__dirname,'dist'))); app.get('*',(_,res)=>res.sendFile(path.join(__dirname,'dist','index.html')));
 const port = Number(process.env.PORT || 3000);
-app.listen(port,()=>console.log(`BugTrack Pro API running on port ${port}`));
+if (process.env.VERCEL !== '1') {
+  app.listen(port,()=>console.log(`BugTrack Pro API running on port ${port}`));
+}
+
+export default app;
