@@ -107,6 +107,7 @@ SMTP_PASSWORD=your-gmail-app-password
 SMTP_FROM_EMAIL=your-sender@gmail.com
 EMAIL_VERIFICATION_EXPIRY_MINUTES=10
 EMAIL_VERIFICATION_SECRET=generate-a-long-random-secret
+SESSION_SECRET=generate-a-long-random-session-secret
 PASSWORD_RESET_EXPIRY_MINUTES=20
 APP_URL=http://localhost:5173
 # Optional comma-separated browser origins allowed to call the API directly.
@@ -117,7 +118,7 @@ For Gmail, use an App Password rather than the normal account password. `SMTP_US
 
 ## User data isolation
 
-Each user receives a stable unique ID at registration (and existing users are migrated once). Successful login creates an HTTP-only session cookie. Bug reports, test cases, analysis integrations, comments, activity, dashboard statistics, exports, and execution history are assigned to and filtered by that authenticated user ID on the backend. Legacy records without an owner are quarantined from normal user views rather than being shown to every account. Logging out invalidates the session and clears user-specific frontend state.
+Each user receives a stable unique ID at registration (and existing users are migrated once). Successful login creates a signed, expiring HTTP-only session cookie that works across serverless instances. Set a stable `SESSION_SECRET` in deployment environments; changing it signs out existing sessions. Bug reports, test cases, analysis integrations, comments, activity, dashboard statistics, exports, and execution history are assigned to and filtered by that authenticated user ID on the backend. Legacy records without an owner are quarantined from normal user views rather than being shown to every account. Logging out clears the session cookie and user-specific frontend state.
 
 Password reset requests use a cryptographically random, single-use token stored only as a hash in `bugtrack.json`. Tokens expire after the configured 15-30 minute window and reset requests are rate limited. Set `APP_URL` to the public frontend URL so reset emails point to the deployed application. Reset requests return the same confirmation for registered and unregistered addresses.
 

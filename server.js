@@ -26,15 +26,33 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json()); app.use('/uploads', express.static(uploadDir));
-const sessions = new Map();
+const sessionSecret = process.env.SESSION_SECRET || process.env.EMAIL_VERIFICATION_SECRET || crypto.randomBytes(32).toString('hex');
+const sessionLifetimeSeconds = 24 * 60 * 60;
 const parseCookies = (header = '') => Object.fromEntries(header.split(';').filter(Boolean).map(part => {
   const index = part.indexOf('=');
   return [part.slice(0, index).trim(), decodeURIComponent(part.slice(index + 1).trim())];
 }));
+const signSession = (userId) => {
+  const payload = Buffer.from(JSON.stringify({ userId, expiresAt: Date.now() + sessionLifetimeSeconds * 1000 })).toString('base64url');
+  const signature = crypto.createHmac('sha256', sessionSecret).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+};
+const readSession = (value) => {
+  try {
+    const [payload, signature] = value.split('.');
+    if (!payload || !signature) return null;
+    const expected = crypto.createHmac('sha256', sessionSecret).update(payload).digest();
+    const actual = Buffer.from(signature, 'base64url');
+    if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return null;
+    const session = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return session.expiresAt > Date.now() ? session : null;
+  } catch {
+    return null;
+  }
+};
 const requireAuth = (req, res, next) => {
-  const sessionId = parseCookies(req.headers.cookie).bugtrack_session;
-  const userId = sessionId && sessions.get(sessionId);
-  const user = userId && db.data.users.find(candidate => candidate.id === userId);
+  const session = readSession(parseCookies(req.headers.cookie).bugtrack_session || '');
+  const user = session && db.data.users.find(candidate => candidate.id === session.userId);
   if (!user) return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
   req.user = user;
   next();
@@ -249,9 +267,9 @@ app.post('/api/login', (req, res) => {
     if (!user.emailVerified) {
       return res.status(403).json({ error: 'Verify your email before signing in.', verificationRequired: true, email: user.email, maskedEmail: maskEmail(user.email) });
     }
-    const sessionId = crypto.randomBytes(32).toString('base64url');
-    sessions.set(sessionId, user.id);
-    res.setHeader('Set-Cookie', `bugtrack_session=${encodeURIComponent(sessionId)}; HttpOnly; SameSite=Lax; Path=/`);
+    const sessionToken = signSession(user.id);
+    const secure = process.env.VERCEL === '1' ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `bugtrack_session=${encodeURIComponent(sessionToken)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${sessionLifetimeSeconds}${secure}`);
     res.json({ id: user.id, name: user.name, role: user.role, email: user.email });
   } catch (error) {
     console.error('Sign-in failed:', error);
@@ -259,8 +277,6 @@ app.post('/api/login', (req, res) => {
   }
 });
 app.post('/api/logout', (req, res) => {
-  const sessionId = parseCookies(req.headers.cookie).bugtrack_session;
-  if (sessionId) sessions.delete(sessionId);
   res.setHeader('Set-Cookie', 'bugtrack_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
   res.status(204).end();
 });
