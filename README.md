@@ -59,6 +59,9 @@ The repository is configured as three Vercel services:
 - `api` serves the Express application at `/api/*`.
 - `analyzer` runs the Flask analyzer internally.
 
+The API service uses `api/index.js` as its entrypoint; its Node runtime is
+inferred by Vercel, because `nodejs20.x` is not a valid Services runtime value.
+
 The `api` service receives the analyzer's internal URL through the
 `ANALYZER_URL` service binding. Do not set `ANALYZER_URL` manually in Vercel.
 Import the repository as a Vercel project and deploy with the defaults from

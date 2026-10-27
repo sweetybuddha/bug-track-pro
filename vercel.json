@@ -7,7 +7,6 @@
     },
     "api": {
       "root": ".",
-      "runtime": "nodejs20.x",
       "entrypoint": "api/index.js",
       "bindings": [
         {
