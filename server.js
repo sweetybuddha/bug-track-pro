@@ -19,6 +19,7 @@ const app = express(); const uploadDir = path.join(runtimeDataDir, 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 const upload = multer({ dest: uploadDir, limits: { fileSize: 5 * 1024 * 1024 } });
 const analyzerUrl = process.env.ANALYZER_URL || 'http://127.0.0.1:5000';
+const analyzerEndpoint = (pathName) => new URL(pathName.replace(/^\/+/, ''), `${analyzerUrl.replace(/\/+$/, '')}/`).toString();
 const trustedOrigins = new Set((process.env.CORS_ORIGINS || 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000')
   .split(',').map(origin => origin.trim()).filter(Boolean));
 app.use(cors({
@@ -77,7 +78,7 @@ app.post('/api/analyzer/analyze', requireAuth, async (req, res) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60_000);
   try {
-    const response = await fetch(`${analyzerUrl}/api/analyzer/analyze`, {
+    const response = await fetch(analyzerEndpoint('/api/analyzer/analyze'), {
       method: 'POST',
       headers: { 'content-type': req.headers['content-type'], accept: 'application/json' },
       body: req,
@@ -103,9 +104,10 @@ app.post('/api/analyzer/analyze', requireAuth, async (req, res) => {
     }
     res.send(body);
   } catch (error) {
+    console.error('Analyzer request failed:', error.code || error.message);
     const message = error.name === 'AbortError'
       ? 'The analyzer service timed out. Check the submitted files and retry.'
-      : 'The analyzer service is unavailable. Start it with npm run dev, then retry.';
+      : 'The analyzer service is unavailable. Check the analyzer service deployment logs and retry.';
     res.status(503).json({ error: message });
   } finally {
     clearTimeout(timeout);
@@ -494,7 +496,7 @@ app.use('/api/analyzer', requireAuth, async (req, res, next) => {
   if (!analysis) return res.status(404).json({ error: 'Analysis report not found.' });
   try {
     const { host, ...forwardHeaders } = req.headers;
-    const response = await fetch(`${analyzerUrl}${req.originalUrl}`, {
+    const response = await fetch(analyzerEndpoint(req.originalUrl), {
       method: req.method,
       headers: forwardHeaders,
       body: ['GET', 'HEAD'].includes(req.method) ? undefined : req,

@@ -19,7 +19,8 @@
     },
     "analyzer": {
       "root": "backend",
-      "framework": "flask"
+      "framework": "flask",
+      "entrypoint": "app:app"
     }
   },
   "rewrites": [

@@ -59,6 +59,9 @@ The repository is configured as three Vercel services:
 - `api` serves the Express application at `/api/*`.
 - `analyzer` runs the Flask analyzer internally.
 
+The Flask service uses the explicit `app:app` entrypoint so Vercel can start
+the WSGI application correctly.
+
 The API service uses `api/index.js` as its entrypoint; its Node runtime is
 inferred by Vercel, because `nodejs20.x` is not a valid Services runtime value.
 
