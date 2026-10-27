@@ -69,9 +69,10 @@ Import the repository as a Vercel project and deploy with the defaults from
 settings, along with `APP_URL` set to the deployed domain and
 `CORS_ORIGINS` set to that same domain.
 
-Vercel functions have temporary filesystems. Move `bugtrack.json`, analyzer
-SQLite data, and uploads to durable managed storage before using this
-deployment for production data.
+Vercel functions have temporary filesystems. The Express and Flask services use
+temporary storage on Vercel so analysis requests can complete, but move
+`bugtrack.json`, analyzer SQLite data, and uploads to durable managed storage
+before using this deployment for production data.
 
 Run analyzer tests:
 
