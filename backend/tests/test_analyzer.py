@@ -219,3 +219,174 @@ def test_empty_and_unsupported_uploads_are_rejected():
     assert "empty" in empty.get_json()["error"].lower()
     assert unsupported.status_code == 400
     assert "unsupported" in unsupported.get_json()["error"].lower()
+
+
+# --- Step 10: Generate Fix & Validation Workflow Tests ---
+
+def test_valid_source_code():
+    """1. Test that valid source code is parsed cleanly and reports no syntax bugs."""
+    client = app.test_client()
+    resp = client.post("/api/analyzer/analyze", data={
+        "source": "def calculate_total(price, tax):\n    return price + (price * tax)\n",
+        "source_filename": "calc.py",
+        "language": "Python"
+    }, content_type="multipart/form-data")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "completed"
+    assert body["summary"]["verdict"] == "NO BUGS DETECTED"
+    assert not any(f["category"] == "Syntax error" for f in body["findings"])
+
+
+def test_source_code_containing_syntax_error():
+    """2. Test that source code with a syntax error is detected and confirmed."""
+    client = app.test_client()
+    resp = client.post("/api/analyzer/analyze", data={
+        "source": "def broken_func(:\n    pass\n",
+        "source_filename": "broken.py",
+        "language": "Python"
+    }, content_type="multipart/form-data")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["summary"]["verdict"] == "BUGS FOUND"
+    assert body["summary"]["confirmed"] >= 1
+    syntax_issues = [f for f in body["findings"] if f["category"] == "Syntax error"]
+    assert len(syntax_issues) >= 1
+    assert syntax_issues[0]["verification"] == "Confirmed"
+
+
+def test_empty_source_code():
+    """3. Test that empty source code input is rejected with 400 and clear error."""
+    client = app.test_client()
+    resp = client.post("/api/analyzer/analyze", data={
+        "source": "   ",
+        "report": "",
+        "logs": "",
+        "language": "Python"
+    }, content_type="multipart/form-data")
+    assert resp.status_code == 400
+    body = resp.get_json()
+    assert body["status"] == "INVALID INPUT"
+    assert "Provide pasted source code" in body["error"]
+
+
+def test_missing_required_request_fields():
+    """4. Test that missing required request fields in fix generation return 400."""
+    client = app.test_client()
+    # Create an analysis first
+    an_res = client.post("/api/analyzer/analyze", data={
+        "source": "x = 1 / 0\n",
+        "language": "Python"
+    }, content_type="multipart/form-data")
+    analysis_id = an_res.get_json()["id"]
+
+    # 4a: Missing whole JSON body
+    empty_fix = client.post(f"/api/analyzer/{analysis_id}/fix", json={})
+    assert empty_fix.status_code == 400
+    assert "required" in empty_fix.get_json()["error"].lower()
+
+    # 4b: Missing 'issue' field
+    no_issue_fix = client.post(f"/api/analyzer/{analysis_id}/fix", json={"other": "data"})
+    assert no_issue_fix.status_code == 400
+    assert "issue object is required" in no_issue_fix.get_json()["error"].lower()
+
+    # 4c: Issue object missing both title and category
+    bad_issue_fix = client.post(f"/api/analyzer/{analysis_id}/fix", json={"issue": {"evidence": "abc"}})
+    assert bad_issue_fix.status_code == 400
+    assert "title or category" in bad_issue_fix.get_json()["error"].lower()
+
+
+def test_missing_or_invalid_ai_configuration(monkeypatch):
+    """5. Test that missing or invalid AI configuration returns clear 503 error."""
+    client = app.test_client()
+    an_res = client.post("/api/analyzer/analyze", data={
+        "source": "if x > 5:\n    print(x)\n",
+        "language": "Python"
+    }, content_type="multipart/form-data")
+    analysis_id = an_res.get_json()["id"]
+    finding = an_res.get_json()["findings"][0]
+
+    # Explicitly clear BUGTRACK_LLM_API_KEY
+    monkeypatch.setenv("BUGTRACK_LLM_API_KEY", "")
+
+    # Request fix with use_ai=True
+    resp = client.post(f"/api/analyzer/{analysis_id}/fix", json={
+        "issue": finding,
+        "use_ai": True
+    })
+    assert resp.status_code == 503
+    body = resp.get_json()
+    assert "BUGTRACK_LLM_API_KEY" in body["error"]
+
+
+def test_ai_provider_failures(monkeypatch):
+    """6. Test that AI provider failure returns a safe, clear 502 error message."""
+    client = app.test_client()
+    an_res = client.post("/api/analyzer/analyze", data={
+        "source": "if x > 5:\n    print(x)\n",
+        "language": "Python"
+    }, content_type="multipart/form-data")
+    analysis_id = an_res.get_json()["id"]
+    finding = an_res.get_json()["findings"][0]
+
+    monkeypatch.setenv("BUGTRACK_LLM_API_KEY", "test-key-12345")
+    monkeypatch.setenv("BUGTRACK_LLM_BASE_URL", "https://api.openai.com/v1")
+
+    # Mock urllib.request.urlopen to simulate provider connection failure
+    import urllib.error
+    def mock_urlopen(req, timeout=15):
+        raise urllib.error.URLError("Connection refused by upstream AI service")
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen)
+
+    resp = client.post(f"/api/analyzer/{analysis_id}/fix", json={
+        "issue": finding,
+        "use_ai": True
+    })
+    assert resp.status_code == 502
+    body = resp.get_json()
+    assert "AI provider failed" in body["error"]
+    assert "Connection refused" in body["error"]
+    # Verify API key is NOT leaked in the error message
+    assert "test-key-12345" not in body["error"]
+
+
+def test_successful_fix_generation():
+    """7. Test successful fix generation and verification for undefined symbol."""
+    client = app.test_client()
+    an_res = client.post("/api/analyzer/analyze", data={
+        "source": "if x > 5:\n    print(x)\n",
+        "source_filename": "main.py",
+        "language": "Python"
+    }, content_type="multipart/form-data")
+    analysis_id = an_res.get_json()["id"]
+    finding = an_res.get_json()["findings"][0]
+
+    resp = client.post(f"/api/analyzer/{analysis_id}/fix", json={
+        "issue": finding
+    })
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "validated"
+    assert body["is_valid"] is True
+    assert body["validation"]["status"] == "Passed"
+    assert "x = 0" in body["proposed"]
+    assert "print(x)" in body["proposed"]
+
+
+def test_failed_fix_validation():
+    """8. Test that a proposed fix containing syntax errors fails validation."""
+    from app import validate_proposed_fix
+    
+    broken_fix = "def broken(\n    return 123\n"
+    issue = {"title": "Sample syntax issue", "category": "Syntax error"}
+    val_result = validate_proposed_fix(broken_fix, issue, "Python")
+    assert val_result["is_valid"] is False
+    assert val_result["status"] == "Failed"
+    assert "Syntax error" in val_result["message"]
+
+    eval_issue = {"title": "Use of eval()", "category": "Security"}
+    still_broken_eval = "x = eval(input())\n"
+    eval_val = validate_proposed_fix(still_broken_eval, eval_issue, "Python")
+    assert eval_val["is_valid"] is False
+    assert "still contains unsafe eval" in eval_val["message"]

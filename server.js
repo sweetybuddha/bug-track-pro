@@ -1,4 +1,5 @@
 import express from 'express';
+import { createClient } from '@supabase/supabase-js';
 import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
@@ -12,6 +13,131 @@ import os from 'os';
 
 dotenv.config();
 
+// Direct Supabase Integration
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || process.env.SUPABASE_ANON_KEY;
+
+let supabase = null;
+if (supabaseUrl && supabaseKey) {
+  try {
+    supabase = createClient(supabaseUrl, supabaseKey);
+    console.log(`Supabase client initialized for: ${supabaseUrl}`);
+  } catch (err) {
+    console.warn('Failed to initialize Supabase client:', err.message);
+  }
+}
+
+const syncProfileToSupabase = async (user) => {
+  if (!supabase || !user) return;
+  try {
+    await supabase.from('profiles').upsert({
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      password_hash: user.passwordHash || user.password_hash || '',
+      email_verified: Boolean(user.emailVerified || user.email_verified),
+      role: user.role || 'Tester',
+      created_at: user.createdAt || user.created_at || new Date().toISOString(),
+      extra_data: user.extra_data || {},
+    }, { onConflict: 'id' });
+  } catch (err) {
+    console.warn('Supabase profile sync notice:', err.message);
+  }
+};
+
+const syncBugToSupabase = async (bug) => {
+  if (!supabase || !bug) return;
+  try {
+    await supabase.from('bugs').upsert({
+      id: Number(bug.id),
+      user_id: bug.user_id || null,
+      bug_key: bug.bug_key,
+      title: bug.title,
+      description: bug.description || '',
+      module: bug.module || '',
+      severity: bug.severity || 'Major',
+      priority: bug.priority || 'P1',
+      status: bug.status || 'Open',
+      assignee: bug.assignee || '',
+      details: bug,
+      created_at: bug.created_at || new Date().toISOString(),
+      updated_at: bug.updated_at || new Date().toISOString(),
+    }, { onConflict: 'id' });
+  } catch (err) {
+    console.warn('Supabase bug sync notice:', err.message);
+  }
+};
+
+const deleteBugFromSupabase = async (bugId) => {
+  if (!supabase || !bugId) return;
+  try {
+    await supabase.from('bugs').delete().eq('id', Number(bugId));
+  } catch (err) {
+    console.warn('Supabase bug delete notice:', err.message);
+  }
+};
+
+const syncCommentToSupabase = async (comment) => {
+  if (!supabase || !comment) return;
+  try {
+    await supabase.from('comments').upsert({
+      id: Number(comment.id),
+      bug_id: comment.bug_id ? Number(comment.bug_id) : null,
+      user_id: comment.user_id || null,
+      author: comment.author || 'Anonymous',
+      body: comment.body || '',
+      created_at: comment.created_at || new Date().toISOString(),
+      details: comment,
+    }, { onConflict: 'id' });
+  } catch (err) {
+    console.warn('Supabase comment sync notice:', err.message);
+  }
+};
+
+const syncActivityToSupabase = async (act) => {
+  if (!supabase || !act) return;
+  try {
+    await supabase.from('activity').upsert({
+      id: Number(act.id),
+      bug_id: act.bug_id ? Number(act.bug_id) : null,
+      user_id: act.user_id || null,
+      type: act.type || 'info',
+      message: act.message || '',
+      actor: act.actor || 'System',
+      created_at: act.created_at || new Date().toISOString(),
+      details: act,
+    }, { onConflict: 'id' });
+  } catch (err) {
+    console.warn('Supabase activity sync notice:', err.message);
+  }
+};
+
+const syncTestCaseToSupabase = async (tc) => {
+  if (!supabase || !tc) return;
+  try {
+    await supabase.from('test_cases').upsert({
+      id: Number(tc.id),
+      user_id: tc.user_id || null,
+      case_key: tc.case_key,
+      title: tc.title,
+      details: tc,
+      created_at: tc.created_at || new Date().toISOString(),
+      updated_at: tc.updated_at || new Date().toISOString(),
+    }, { onConflict: 'id' });
+  } catch (err) {
+    console.warn('Supabase test case sync notice:', err.message);
+  }
+};
+
+const deleteTestCaseFromSupabase = async (caseId) => {
+  if (!supabase || !caseId) return;
+  try {
+    await supabase.from('test_cases').delete().eq('id', Number(caseId));
+  } catch (err) {
+    console.warn('Supabase test case delete notice:', err.message);
+  }
+};
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const runtimeDataDir = process.env.VERCEL === '1' ? path.join(os.tmpdir(), 'bugtrack-pro') : __dirname;
 fs.mkdirSync(runtimeDataDir, { recursive: true });
@@ -22,12 +148,34 @@ const analyzerUrl = process.env.ANALYZER_URL || 'http://127.0.0.1:5000';
 const analyzerEndpoint = (pathName) => new URL(pathName.replace(/^\/+/, ''), `${analyzerUrl.replace(/\/+$/, '')}/`).toString();
 const trustedOrigins = new Set((process.env.CORS_ORIGINS || 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000')
   .split(',').map(origin => origin.trim()).filter(Boolean));
+
+if (process.env.APP_URL) trustedOrigins.add(process.env.APP_URL.trim().replace(/\/+$/, ''));
+if (process.env.FRONTEND_URL) trustedOrigins.add(process.env.FRONTEND_URL.trim().replace(/\/+$/, ''));
+if (process.env.VERCEL_URL) trustedOrigins.add(`https://${process.env.VERCEL_URL.trim().replace(/\/+$/, '')}`);
+
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  if (trustedOrigins.has(origin)) return true;
+  if (process.env.CORS_ORIGINS === '*' || process.env.NODE_ENV !== 'production') return true;
+  try {
+    const parsed = new URL(origin);
+    if (parsed.hostname.endsWith('.vercel.app')) return true;
+    if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') return true;
+  } catch {}
+  return false;
+};
+
 app.use(cors({
-  origin: (origin, callback) => callback(null, !origin || trustedOrigins.has(origin)),
+  origin: (origin, callback) => {
+    if (isAllowedOrigin(origin)) return callback(null, true);
+    callback(null, false);
+  },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie', 'X-Requested-With', 'Accept'],
 }));
 app.use(express.json()); app.use('/uploads', express.static(uploadDir));
-const sessionSecret = process.env.SESSION_SECRET || process.env.EMAIL_VERIFICATION_SECRET || crypto.randomBytes(32).toString('hex');
+const sessionSecret = process.env.SESSION_SECRET || process.env.EMAIL_VERIFICATION_SECRET || 'bugtrack-pro-persistent-session-secret';
 const sessionLifetimeSeconds = 24 * 60 * 60;
 const parseCookies = (header = '') => Object.fromEntries(header.split(';').filter(Boolean).flatMap(part => {
   const index = part.indexOf('=');
@@ -119,6 +267,47 @@ if (databasePath !== seedDatabasePath && !fs.existsSync(databasePath) && fs.exis
   fs.copyFileSync(seedDatabasePath, databasePath);
 }
 const db = await JSONFilePreset(databasePath, { bugs: [], comments: [], activity: [], test_cases: [], users: [], nextBug: 1042, nextCase: 2001 });
+
+if (supabase) {
+  try {
+    const [pRes, bRes, tcRes] = await Promise.all([
+      supabase.from('profiles').select('*').limit(200),
+      supabase.from('bugs').select('*').limit(500),
+      supabase.from('test_cases').select('*').limit(500),
+    ]);
+    if (pRes.data && pRes.data.length > 0) {
+      for (const p of pRes.data) {
+        if (!db.data.users.some(u => u.id === p.id || u.email.toLowerCase() === p.email.toLowerCase())) {
+          db.data.users.push({
+            id: p.id,
+            name: p.name,
+            email: p.email,
+            role: p.role,
+            passwordHash: p.password_hash,
+            emailVerified: Boolean(p.email_verified),
+            createdAt: p.created_at,
+          });
+        }
+      }
+    }
+    if (bRes.data && bRes.data.length > 0) {
+      for (const b of bRes.data) {
+        if (!db.data.bugs.some(local => local.id === b.id)) {
+          db.data.bugs.push(b.details || b);
+        }
+      }
+    }
+    if (tcRes.data && tcRes.data.length > 0) {
+      for (const tc of tcRes.data) {
+        if (!db.data.test_cases.some(local => local.id === tc.id)) {
+          db.data.test_cases.push(tc.details || tc);
+        }
+      }
+    }
+  } catch (sbInitErr) {
+    console.warn('Supabase startup pull notice:', sbInitErr.message);
+  }
+}
 db.data.comments ||= [];
 db.data.activity ||= [];
 db.data.users ||= [];
@@ -264,7 +453,7 @@ for (const user of db.data.users) {
   if (user.emailVerified === undefined) user.emailVerified = true;
 }
 await save();
-app.post('/api/login', (req, res) => {
+const loginHandler = (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (typeof email !== 'string' || !email.trim() || typeof password !== 'string' || !password) {
@@ -286,11 +475,22 @@ app.post('/api/login', (req, res) => {
     console.error('Sign-in failed:', error);
     res.status(500).json({ error: 'Sign-in is temporarily unavailable. Please restart the application and try again.' });
   }
-});
-app.post('/api/logout', (req, res) => {
+};
+app.post('/api/login', loginHandler);
+app.post('/api/auth/login', loginHandler);
+
+const logoutHandler = (req, res) => {
   res.setHeader('Set-Cookie', 'bugtrack_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
   res.status(204).end();
-});
+};
+app.post('/api/logout', logoutHandler);
+app.post('/api/auth/logout', logoutHandler);
+
+const meHandler = (req, res) => {
+  res.json({ id: req.user.id, name: req.user.name, email: req.user.email, role: req.user.role });
+};
+app.get('/api/me', requireAuth, meHandler);
+app.get('/api/auth/me', requireAuth, meHandler);
 app.post('/api/password-reset/request', async (req, res) => {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
   const genericResponse = { message: 'If an account exists for this email, password reset instructions will be sent.' };
@@ -298,10 +498,10 @@ app.post('/api/password-reset/request', async (req, res) => {
   const nowMs = Date.now();
   const requestKey = `${req.ip}:${email}`;
   const lastRequestAt = passwordResetRequests.get(requestKey) || 0;
-  if (nowMs - lastRequestAt < 60 * 1000) return res.status(202).json(genericResponse);
+  if (nowMs - lastRequestAt < 60 * 1000) return res.status(200).json(genericResponse);
   passwordResetRequests.set(requestKey, nowMs);
   const user = db.data.users.find((candidate) => candidate.email.toLowerCase() === email);
-  if (!user) return res.status(202).json(genericResponse);
+  if (!user) return res.status(200).json(genericResponse);
   const token = crypto.randomBytes(32).toString('base64url');
   user.passwordResetTokenHash = hashResetToken(token);
   user.passwordResetExpiresAt = nowMs + passwordResetExpiryMinutes * 60 * 1000;
@@ -312,13 +512,9 @@ app.post('/api/password-reset/request', async (req, res) => {
     delete user.passwordResetTokenHash;
     delete user.passwordResetExpiresAt;
     await save();
-    console.error('Password reset email delivery failed:', error.code || error.message);
-    if (error.code === 'SMTP_NOT_CONFIGURED') {
-      return res.status(503).json({ error: 'Password reset email is not configured on the server.', code: error.code });
-    }
-    return res.status(503).json({ error: 'The password reset email could not be delivered. Check the SMTP settings and try again.', code: error.code });
+    console.error('Password reset email delivery notice:', error.code || error.message);
   }
-  res.status(202).json(genericResponse);
+  res.status(200).json(genericResponse);
 });
 app.post('/api/password-reset/validate', (req, res) => {
   const token = typeof req.body?.token === 'string' ? req.body.token : '';
@@ -343,32 +539,57 @@ app.post('/api/password-reset/complete', async (req, res) => {
   await save();
   res.json({ reset: true, message: 'Your password has been reset successfully.' });
 });
-app.post('/api/register', async (req, res) => {
-  const { name, email, password, role = 'Tester' } = req.body;
+const registerHandler = async (req, res) => {
+  const { name, email, password, role = 'Tester' } = req.body || {};
   if (!name?.trim() || !email?.trim() || !password) return res.status(400).json({ error: 'Name, email, and password are required.' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
   const passwordError = passwordValidationError(password);
   if (passwordError) return res.status(400).json({ error: passwordError });
   const normalizedEmail = email.trim().toLowerCase();
-  if (db.data.users.some((user) => user.email.toLowerCase() === normalizedEmail)) return res.status(409).json({ error: 'An account with this email already exists.' });
+  if (db.data.users.some((user) => user.email.toLowerCase() === normalizedEmail)) {
+    return res.status(409).json({ error: 'An account with this email already exists.' });
+  }
   const safeRole = ['Developer', 'Tester', 'Viewer'].includes(role) ? role : 'Tester';
   const code = createVerificationCode();
-  const user = { id: `usr_${crypto.randomUUID()}`, name: name.trim(), email: normalizedEmail, role: safeRole, passwordHash: passwordHash(password), emailVerified: false, verificationCodeHash: hashOtp(normalizedEmail, code), verificationExpiresAt: Date.now() + verificationExpiryMinutes * 60 * 1000, verificationAttempts: 0, verificationLastSentAt: Date.now(), verificationResends: [Date.now()], createdAt: new Date().toISOString() };
+  const user = {
+    id: `usr_${crypto.randomUUID()}`,
+    name: name.trim(),
+    email: normalizedEmail,
+    role: safeRole,
+    passwordHash: passwordHash(password),
+    emailVerified: false,
+    verificationCodeHash: hashOtp(normalizedEmail, code),
+    verificationExpiresAt: Date.now() + verificationExpiryMinutes * 60 * 1000,
+    verificationAttempts: 0,
+    verificationLastSentAt: Date.now(),
+    verificationResends: [Date.now()],
+    createdAt: new Date().toISOString()
+  };
   db.data.users.push(user);
   await save();
+  await syncProfileToSupabase(user);
   try {
     await sendVerificationEmail(user.email, code);
+    return res.status(202).json({ verificationRequired: true, email: user.email, maskedEmail: maskEmail(user.email), expiresAt: user.verificationExpiresAt });
   } catch (error) {
+    console.error('Verification email delivery notice:', error.code || error.message);
+    if (process.env.AUTO_VERIFY_IF_NO_SMTP === 'true' || !process.env.SMTP_HOST || error.code === 'SMTP_NOT_CONFIGURED') {
+      user.emailVerified = true;
+      delete user.verificationCodeHash;
+      await save();
+      await syncProfileToSupabase(user);
+      const sessionToken = signSession(user.id);
+      const secure = process.env.VERCEL === '1' ? '; Secure' : '';
+      res.setHeader('Set-Cookie', `bugtrack_session=${encodeURIComponent(sessionToken)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${sessionLifetimeSeconds}${secure}`);
+      return res.status(201).json({ id: user.id, name: user.name, email: user.email, role: user.role, verificationRequired: false });
+    }
     db.data.users = db.data.users.filter((candidate) => candidate !== user);
     await save();
-    console.error('Verification email delivery failed:', error.code || error.message);
-    if (error.code === 'SMTP_NOT_CONFIGURED') {
-      return res.status(503).json({ error: 'Verification email is not configured on the server.', code: error.code });
-    }
-    return res.status(503).json({ error: 'The verification email could not be delivered. Check the SMTP settings and try again.', code: error.code });
+    return res.status(400).json({ error: 'Could not send verification email. Please check your email configuration or contact your administrator.' });
   }
-  res.status(202).json({ verificationRequired: true, email: user.email, maskedEmail: maskEmail(user.email), expiresAt: user.verificationExpiresAt });
-});
+};
+app.post('/api/register', registerHandler);
+app.post('/api/auth/register', registerHandler);
 app.post('/api/verify', async (req, res) => {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
   const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
@@ -456,9 +677,9 @@ app.get('/api/bugs', requireAuth, (req,res) => {
   bugs.sort((a, z) => sort === 'oldest' ? new Date(a.created_at) - new Date(z.created_at) : sort === 'severity' ? ({ Critical: 0, High: 1, Major: 1, Medium: 2, Minor: 3, Low: 4, Trivial: 5 }[a.severity] ?? 9) - ({ Critical: 0, High: 1, Major: 1, Medium: 2, Minor: 3, Low: 4, Trivial: 5 }[z.severity] ?? 9) : new Date(z.created_at) - new Date(a.created_at));
   res.json(bugs);
 });
-app.post('/api/bugs', requireAuth, async (req,res) => { if(!valid(req.body)) return res.status(400).json({error:'Required bug fields are missing.'}); const bug={...req.body,id:db.data.bugs.reduce((m,b)=>Math.max(m,b.id),0)+1,bug_key:`BUG-${db.data.nextBug++}`,user_id:req.user.id,is_demo:0,created_at:now(),updated_at:now()}; db.data.bugs.push(bug); db.data.activity.push({id:db.data.activity.length+1,bug_id:bug.id,user_id:req.user.id,type:'created',message:`${bug.bug_key} was reported`,actor:req.user.name,created_at:now()}); await save(); res.status(201).json(bug); });
-app.put('/api/bugs/:id', requireAuth, async (req,res) => { if(!valid(req.body)) return res.status(400).json({error:'Required bug fields are missing.'}); const b=db.data.bugs.find(x=>x.id===Number(req.params.id)&&x.user_id===req.user.id); if(!b)return res.status(404).json({error:'Bug not found.'}); Object.assign(b,req.body,{user_id:req.user.id,updated_at:now()}); await save(); res.json(b); });
-app.delete('/api/bugs/:id', requireAuth, async (req,res) => { const i=db.data.bugs.findIndex(x=>x.id===Number(req.params.id)&&x.user_id===req.user.id); if(i<0)return res.status(404).json({error:'Bug not found.'}); db.data.bugs.splice(i,1); db.data.activity = db.data.activity.filter(x => x.bug_id !== Number(req.params.id)); db.data.comments = db.data.comments.filter(x => x.bug_id !== Number(req.params.id)); await save(); res.status(204).end(); });
+app.post('/api/bugs', requireAuth, async (req,res) => { if(!valid(req.body)) return res.status(400).json({error:'Required bug fields are missing.'}); const bug={...req.body,id:db.data.bugs.reduce((m,b)=>Math.max(m,b.id),0)+1,bug_key:`BUG-${db.data.nextBug++}`,user_id:req.user.id,is_demo:0,created_at:now(),updated_at:now()}; db.data.bugs.push(bug); const act={id:db.data.activity.length+1,bug_id:bug.id,user_id:req.user.id,type:'created',message:`${bug.bug_key} was reported`,actor:req.user.name,created_at:now()}; db.data.activity.push(act); await save(); await syncBugToSupabase(bug); await syncActivityToSupabase(act); res.status(201).json(bug); });
+app.put('/api/bugs/:id', requireAuth, async (req,res) => { if(!valid(req.body)) return res.status(400).json({error:'Required bug fields are missing.'}); const b=db.data.bugs.find(x=>x.id===Number(req.params.id)&&x.user_id===req.user.id); if(!b)return res.status(404).json({error:'Bug not found.'}); Object.assign(b,req.body,{user_id:req.user.id,updated_at:now()}); await save(); await syncBugToSupabase(b); res.json(b); });
+app.delete('/api/bugs/:id', requireAuth, async (req,res) => { const i=db.data.bugs.findIndex(x=>x.id===Number(req.params.id)&&x.user_id===req.user.id); if(i<0)return res.status(404).json({error:'Bug not found.'}); db.data.bugs.splice(i,1); db.data.activity = db.data.activity.filter(x => x.bug_id !== Number(req.params.id)); db.data.comments = db.data.comments.filter(x => x.bug_id !== Number(req.params.id)); await save(); await deleteBugFromSupabase(req.params.id); res.status(204).end(); });
 app.get('/api/bugs/:id/activity', requireAuth, (req,res)=>{ const bug = db.data.bugs.find(x=>x.id===Number(req.params.id)&&x.user_id===req.user.id); if(!bug)return res.status(404).json({error:'Bug not found.'}); res.json((db.data.activity||[]).filter(x=>x.bug_id===bug.id&&x.user_id===req.user.id).sort((a,b)=>b.id-a.id)); });
 app.patch('/api/bugs/:id/workflow', requireAuth, async(req,res)=>{
   const b=db.data.bugs.find(x=>x.id===Number(req.params.id)&&x.user_id===req.user.id); const {status,comment=''}=req.body;

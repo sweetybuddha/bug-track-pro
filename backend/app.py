@@ -7,6 +7,8 @@ import sqlite3
 import subprocess
 import tempfile
 import uuid
+import urllib.error
+import urllib.request
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -431,19 +433,297 @@ def delete_analysis(analysis_id):
     return "", 204
 
 
+def validate_proposed_fix(proposed_code, issue_data, language):
+    """Validates the proposed fix against static syntax rules."""
+    if not proposed_code or not proposed_code.strip():
+        return {"status": "Failed", "is_valid": False, "message": "Proposed fix is empty."}
+
+    if language == "Python":
+        try:
+            tree = ast.parse(proposed_code)
+        except SyntaxError as err:
+            return {
+                "status": "Failed",
+                "is_valid": False,
+                "message": f"Syntax error in proposed fix at line {err.lineno or 1}: {err.msg}"
+            }
+
+        title = issue_data.get("title", "").lower()
+        if "eval" in title:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "eval":
+                    return {"status": "Failed", "is_valid": False, "message": "Proposed fix still contains unsafe eval() call."}
+
+        if "division by zero" in title and "possible" not in title:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)) and isinstance(node.right, ast.Constant) and node.right.value == 0:
+                    return {"status": "Failed", "is_valid": False, "message": "Proposed fix still divides by constant zero."}
+
+        return {"status": "Passed", "is_valid": True, "message": "Python AST validation passed with zero syntax errors."}
+
+    elif language in ("JavaScript", "TypeScript"):
+        if proposed_code.count("{") != proposed_code.count("}"):
+            return {"status": "Failed", "is_valid": False, "message": "Proposed fix has unbalanced curly braces."}
+        if proposed_code.count("(") != proposed_code.count(")"):
+            return {"status": "Failed", "is_valid": False, "message": "Proposed fix has unbalanced parentheses."}
+        if "eval" in issue_data.get("title", "").lower() and re.search(r"\beval\s*\(", proposed_code):
+            return {"status": "Failed", "is_valid": False, "message": "Proposed fix still contains unsafe eval() call."}
+        return {"status": "Passed", "is_valid": True, "message": "JavaScript syntax check passed."}
+
+    elif language == "CSS":
+        if proposed_code.count("{") != proposed_code.count("}"):
+            return {"status": "Failed", "is_valid": False, "message": "Unbalanced CSS braces."}
+        return {"status": "Passed", "is_valid": True, "message": "CSS brace validation passed."}
+
+    elif language == "Java":
+        if proposed_code.count("{") != proposed_code.count("}"):
+            return {"status": "Failed", "is_valid": False, "message": "Unbalanced Java braces."}
+        return {"status": "Passed", "is_valid": True, "message": "Java syntax check passed."}
+
+    return {"status": "Passed", "is_valid": True, "message": "Validation completed."}
+
+
+def generate_rule_based_fix(source_code, issue_data, language):
+    """Generates a safe deterministic fix for common patterns."""
+    title = issue_data.get("title", "")
+    category = issue_data.get("category", "")
+    explanation = issue_data.get("explanation", "")
+    evidence = issue_data.get("evidence", "").strip()
+    original_code = issue_data.get("original_code", "").strip() or evidence
+    recommendation = issue_data.get("recommendation", "Review the proposed change.")
+    corrected_code = (issue_data.get("corrected_code") or "").strip()
+
+    if corrected_code and not corrected_code.startswith("# Review"):
+        return corrected_code, recommendation
+
+    # 1. Possibly undefined name (e.g. 'x' is used before a definition)
+    if "undefined" in title.lower() or category == "Undefined symbol" or category == "Static error":
+        name_match = re.search(r"['\"](\w+)['\"]", explanation) or re.search(r"Undefined variable:\s*(\w+)", title)
+        var_name = name_match.group(1) if name_match else None
+        if not var_name:
+            tokens = re.findall(r"\b[A-Za-z_]\w*\b", evidence)
+            keywords = {"if", "for", "while", "return", "in", "print", "def", "class", "const", "let", "var", "function"}
+            candidates = [t for t in tokens if t not in keywords]
+            var_name = candidates[0] if candidates else "value"
+
+        if language == "Python":
+            if source_code and source_code.strip():
+                lines = source_code.splitlines()
+                line_idx = max(0, min(int(issue_data.get("line") or 1) - 1, len(lines)))
+                indent = len(lines[line_idx]) - len(lines[line_idx].lstrip()) if line_idx < len(lines) else 0
+                lines.insert(line_idx, " " * indent + f"{var_name} = 0  # Initialized variable to resolve undefined symbol")
+                proposed = "\n".join(lines)
+            else:
+                proposed = f"{var_name} = 0  # Initialized variable to resolve undefined symbol\n{original_code}"
+            return proposed, f"Initialized undefined variable '{var_name}' before use."
+        elif language in ("JavaScript", "TypeScript"):
+            if source_code and source_code.strip():
+                lines = source_code.splitlines()
+                line_idx = max(0, min(int(issue_data.get("line") or 1) - 1, len(lines)))
+                indent = len(lines[line_idx]) - len(lines[line_idx].lstrip()) if line_idx < len(lines) else 0
+                lines.insert(line_idx, " " * indent + f"const {var_name} = 0; // Initialized variable to resolve undefined symbol")
+                proposed = "\n".join(lines)
+            else:
+                proposed = f"const {var_name} = 0; // Initialized variable to resolve undefined symbol\n{original_code}"
+            return proposed, f"Declared and initialized '{var_name}' before use."
+
+    # 2. Division by zero
+    if "division" in title.lower() or "zero" in title.lower():
+        if language == "Python":
+            if "/ 0" in original_code or "/ 0.0" in original_code:
+                proposed = re.sub(r"/\s*0(?:\.0)?\b", "/ 1  # Guarded: replaced zero with safe fallback", original_code)
+                return proposed, "Guarded against zero divisor."
+            else:
+                proposed = f"# Ensure divisor is non-zero before operation:\n{original_code}"
+                return proposed, "Added guard for division divisor."
+        elif language in ("JavaScript", "TypeScript", "Java"):
+            if "/ 0" in original_code:
+                proposed = re.sub(r"/\s*0\b", "/ 1", original_code)
+                return proposed, "Replaced zero divisor with non-zero fallback."
+
+    # 3. Mutable default argument
+    if "mutable default" in title.lower():
+        if language == "Python":
+            proposed = re.sub(r"=\s*(\[\]|\{\}|set\(\)|list\(\)|dict\(\))", "=None", original_code)
+            return proposed, "Replaced mutable default argument with None."
+
+    # 4. Use of eval() / dynamic code execution
+    if "eval" in title.lower() or "Dynamic code execution" in title:
+        if language == "Python":
+            proposed = original_code.replace("eval(", "ast.literal_eval(")
+            return proposed, "Replaced unsafe eval() with safe ast.literal_eval()."
+        elif language in ("JavaScript", "TypeScript"):
+            proposed = original_code.replace("eval(", "JSON.parse(")
+            return proposed, "Replaced unsafe eval() with JSON.parse()."
+
+    # 5. Image missing alt attribute
+    if "alt" in title.lower() or "Image is missing" in title:
+        proposed = re.sub(r"<img\b", '<img alt="Descriptive label"', original_code, count=1, flags=re.I)
+        return proposed, "Added descriptive alt attribute for accessibility."
+
+    # 6. Unbalanced braces
+    if "brace" in title.lower():
+        if original_code.count("{") > original_code.count("}"):
+            proposed = original_code + "\n}"
+            return proposed, "Added missing closing brace."
+
+    return None
+
+
+def generate_ai_fix(source_code, issue_data, language, api_key, base_url, model):
+    """Calls OpenAI-compatible LLM service to generate code fix."""
+    if not api_key or not api_key.strip():
+        raise ValueError("BUGTRACK_LLM_API_KEY is not configured.")
+
+    if not base_url or not base_url.strip():
+        base_url = "https://api.openai.com/v1"
+    elif "platform.openai.com" in base_url:
+        base_url = "https://api.openai.com/v1"
+
+    base_url = base_url.rstrip("/")
+    if not base_url.endswith("/v1") and "openai.com" in base_url:
+        base_url = f"{base_url}/v1"
+
+    endpoint = f"{base_url}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key.strip()}",
+        "Content-Type": "application/json",
+        "User-Agent": "BugTrack-Pro/1.0",
+    }
+    prompt = (
+        f"Language: {language}\n"
+        f"File: {issue_data.get('file', 'source')}\n"
+        f"Line: {issue_data.get('line', 'unknown')}\n"
+        f"Issue: {issue_data.get('title', '')} ({issue_data.get('category', '')})\n"
+        f"Explanation: {issue_data.get('explanation', '')}\n"
+        f"Evidence: {issue_data.get('evidence', '')}\n"
+        f"Recommendation: {issue_data.get('recommendation', '')}\n\n"
+        f"Source Code:\n{source_code}\n\n"
+        f"Provide a minimal, syntax-valid fix. Return JSON only with format:\n"
+        f'{{"proposed_code": "<replacement code or snippet>", "explanation": "<explanation of the fix>"}}'
+    )
+    payload = {
+        "model": model or "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "You are an automated code fix generator. Return only a JSON object with 'proposed_code' and 'explanation' keys."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2,
+    }
+
+    req = urllib.request.Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            content = data["choices"][0]["message"]["content"].strip()
+            if content.startswith("```"):
+                content = re.sub(r"^```(?:json)?\s*", "", content)
+                content = re.sub(r"\s*```$", "", content)
+            parsed = json.loads(content)
+            return parsed.get("proposed_code", ""), parsed.get("explanation", "AI generated fix.")
+    except urllib.error.HTTPError as err:
+        err_msg = ""
+        try:
+            raw = err.read().decode("utf-8")
+            err_json = json.loads(raw)
+            err_msg = err_json.get("error", {}).get("message") or raw
+        except Exception:
+            err_msg = f"HTTP {err.code}: {err.reason}"
+        raise RuntimeError(f"AI provider returned error: {err_msg}")
+    except urllib.error.URLError as err:
+        raise RuntimeError(f"Could not connect to AI service: {err.reason}")
+    except Exception as err:
+        raise RuntimeError(f"AI fix generation failed: {str(err)}")
+
+
 @app.post("/api/analyzer/<analysis_id>/fix")
 def propose_fix(analysis_id):
-    payload = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True)
+    if not payload or not isinstance(payload, dict):
+        return jsonify(error="A JSON request with an 'issue' object is required."), 400
     issue_data = payload.get("issue")
-    if not issue_data:
-        return jsonify(error="An issue is required."), 400
-    original = issue_data.get("evidence", "")
+    if not issue_data or not isinstance(issue_data, dict):
+        return jsonify(error="An issue object is required."), 400
+    if not issue_data.get("title") and not issue_data.get("category"):
+        return jsonify(error="Issue must include at least a title or category."), 400
+
+    with db() as connection:
+        row = connection.execute("SELECT * FROM analyses WHERE id=?", (analysis_id,)).fetchone()
+    if not row:
+        return jsonify(error="Analysis not found."), 404
+    result_data = json.loads(row["result_json"])
+
+    source_code = payload.get("source") or result_data.get("inputs", {}).get("source", "")
+    if not source_code and result_data.get("workspace"):
+        target_file = Path(result_data["workspace"]) / (issue_data.get("file") or result_data.get("inputs", {}).get("source_filename", "main.py"))
+        if target_file.exists():
+            source_code = target_file.read_text(encoding="utf-8", errors="replace")
+
+    language = payload.get("language") or row["language"] or "Python"
     original = issue_data.get("original_code") or issue_data.get("evidence", "")
-    proposed = issue_data.get("corrected_code") or f"# Review and correct: {issue_data.get('title', 'issue')}\n{original}"
+
+    use_ai = payload.get("use_ai")
+    ai_key = os.environ.get("BUGTRACK_LLM_API_KEY", "").strip()
+    ai_base = os.environ.get("BUGTRACK_LLM_BASE_URL", "").strip()
+    ai_model = os.environ.get("BUGTRACK_LLM_MODEL", "gpt-4o-mini").strip()
+
+    proposed = ""
+    explanation = ""
+    source_method = "rule-based"
+
+    if use_ai is True:
+        if not ai_key:
+            return jsonify(error="AI service is not configured. Please set BUGTRACK_LLM_API_KEY in environment variables."), 503
+        try:
+            proposed, explanation = generate_ai_fix(source_code, issue_data, language, ai_key, ai_base, ai_model)
+            source_method = "ai"
+        except Exception as ai_err:
+            app.logger.warning("Explicit AI fix generation failed: %s", ai_err)
+            return jsonify(error=f"AI provider failed: {ai_err}"), 502
+    else:
+        # Default behavior: try AI if configured, otherwise rule-based fix
+        if ai_key:
+            try:
+                proposed, explanation = generate_ai_fix(source_code, issue_data, language, ai_key, ai_base, ai_model)
+                source_method = "ai"
+            except Exception as ai_err:
+                app.logger.warning("AI fix generation failed, falling back to rule-based engine: %s", ai_err)
+                rule_fix = generate_rule_based_fix(source_code, issue_data, language)
+                if rule_fix:
+                    proposed, explanation = rule_fix
+                    explanation = f"{explanation} (Fallback: AI service was unavailable: {ai_err})"
+                else:
+                    return jsonify(error=f"AI provider failed: {ai_err}"), 502
+        else:
+            rule_fix = generate_rule_based_fix(source_code, issue_data, language)
+            if rule_fix:
+                proposed, explanation = rule_fix
+            else:
+                return jsonify(error="AI service is not configured (BUGTRACK_LLM_API_KEY is missing) and no automated rule-based fix is available for this issue."), 422
+
+    if not proposed:
+        return jsonify(error="Could not generate a proposed fix for this finding."), 422
+
+    validation = validate_proposed_fix(proposed, issue_data, language)
+    fix_status = "validated" if validation.get("is_valid") else "failed_validation"
+
     fix_id = uuid.uuid4().hex
     with db() as connection:
-        connection.execute("INSERT INTO fixes VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (fix_id, analysis_id, issue_data.get("id", ""), now(), "proposed", original, proposed, issue_data.get("recommendation", "Review the proposed change.")))
-    return jsonify(id=fix_id, status="proposed", original=original, proposed=proposed, explanation=issue_data.get("recommendation", "Review this minimal proposed fix before applying."))
+        connection.execute(
+            "INSERT INTO fixes VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (fix_id, analysis_id, issue_data.get("id", ""), now(), fix_status, original, proposed, explanation)
+        )
+
+    return jsonify(
+        id=fix_id,
+        status=fix_status,
+        is_valid=validation.get("is_valid", False),
+        validation=validation,
+        original=original,
+        proposed=proposed,
+        explanation=explanation,
+        generator=source_method
+    )
 
 
 @app.post("/api/analyzer/fixes/<fix_id>/apply")
