@@ -16,7 +16,16 @@ const getApiBaseUrl = () => {
     return String(window.__BUGTRACK_API_URL__).trim().replace(/^["']|["']$/g, '').replace(/\/+$/, '');
   }
   const envUrl = (import.meta.env.VITE_API_URL || '').trim().replace(/^["']|["']$/g, '').replace(/\/+$/, '');
-  return envUrl;
+  if (envUrl) return envUrl;
+
+  // Auto-connect to your live Render backend when running on Vercel or other cloud frontends
+  if (typeof window !== 'undefined') {
+    const host = window.location.hostname;
+    if (host.endsWith('.vercel.app') || host.endsWith('.netlify.app') || host.endsWith('.github.io')) {
+      return 'https://bug-track-pro.onrender.com';
+    }
+  }
+  return '';
 };
 const resolveApiUrl = (url) => {
   if (!url) return '';
