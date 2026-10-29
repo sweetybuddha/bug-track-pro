@@ -499,6 +499,10 @@ const sendVerificationEmail = async (email, code) => {
   }
 };
 const resolveResetBaseUrl = (req) => {
+  // 1. Primary authority: Configured environment variables (FRONTEND_URL or APP_URL)
+  const envUrl = (process.env.FRONTEND_URL || process.env.APP_URL || '').trim().replace(/\/+$/, '');
+
+  // 2. Extract and validate client origin if present
   let origin = null;
   const reqOrigin = req.get('origin');
   if (reqOrigin) {
@@ -510,21 +514,31 @@ const resolveResetBaseUrl = (req) => {
     }
   }
 
-  // Check if client origin is in allowed origins
-  if (origin && isAllowedOrigin(origin)) {
-    // If request originated from localhost development
-    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  // In production, strictly use configured deployed domain or trusted remote origin (never localhost)
+  if (isProduction) {
+    if (envUrl && !envUrl.includes('localhost') && !envUrl.includes('127.0.0.1')) {
+      return envUrl;
+    }
+    if (origin && isAllowedOrigin(origin) && !origin.includes('localhost') && !origin.includes('127.0.0.1')) {
       return origin;
     }
-    // In production, prioritize FRONTEND_URL or APP_URL if configured, or use the allowed cloud origin
-    return process.env.FRONTEND_URL || process.env.APP_URL || origin;
+    return envUrl || (origin && isAllowedOrigin(origin) ? origin : '');
   }
 
-  // Trusted environment defaults (prevents host-header/reset-poisoning attacks)
-  if (process.env.NODE_ENV === 'production') {
-    return process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5173';
+  // In development:
+  // If the user has configured FRONTEND_URL or APP_URL (e.g. deployed domain, LAN IP, or tunnel),
+  // honor it so password reset links can be opened on both laptops and mobile devices.
+  if (envUrl) {
+    return envUrl;
   }
-  return process.env.FRONTEND_URL || 'http://localhost:5173';
+
+  // Otherwise, use verified request origin if available, or default to standard local Vite dev URL
+  if (origin && isAllowedOrigin(origin)) {
+    return origin;
+  }
+  return 'http://localhost:5173';
 };
 
 const sendPasswordResetEmail = async (email, token, baseUrl) => {
