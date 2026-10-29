@@ -30,6 +30,11 @@ if (supabaseUrl && supabaseKey) {
 const syncProfileToSupabase = async (user) => {
   if (!supabase || !user) return;
   try {
+    const extra_data = {
+      ...(user.extra_data || {}),
+      passwordResetTokenHash: user.passwordResetTokenHash || null,
+      passwordResetExpiresAt: user.passwordResetExpiresAt || null,
+    };
     await supabase.from('profiles').upsert({
       id: user.id,
       name: user.name,
@@ -38,7 +43,7 @@ const syncProfileToSupabase = async (user) => {
       email_verified: Boolean(user.emailVerified || user.email_verified),
       role: user.role || 'Tester',
       created_at: user.createdAt || user.created_at || new Date().toISOString(),
-      extra_data: user.extra_data || {},
+      extra_data,
     }, { onConflict: 'id' });
   } catch (err) {
     console.warn('Supabase profile sync notice:', err.message);
@@ -141,12 +146,14 @@ const deleteTestCaseFromSupabase = async (caseId) => {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const runtimeDataDir = process.env.VERCEL === '1' ? path.join(os.tmpdir(), 'bugtrack-pro') : __dirname;
 fs.mkdirSync(runtimeDataDir, { recursive: true });
-const app = express(); const uploadDir = path.join(runtimeDataDir, 'uploads');
+const app = express();
+app.set('trust proxy', 1);
+const uploadDir = path.join(runtimeDataDir, 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 const upload = multer({ dest: uploadDir, limits: { fileSize: 5 * 1024 * 1024 } });
 const analyzerUrl = process.env.ANALYZER_URL || 'http://127.0.0.1:5000';
 const analyzerEndpoint = (pathName) => new URL(pathName.replace(/^\/+/, ''), `${analyzerUrl.replace(/\/+$/, '')}/`).toString();
-const trustedOrigins = new Set((process.env.CORS_ORIGINS || 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000')
+const trustedOrigins = new Set((process.env.CORS_ORIGINS || 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5174,http://127.0.0.1:5174')
   .split(',').map(origin => origin.trim()).filter(Boolean));
 
 if (process.env.APP_URL) trustedOrigins.add(process.env.APP_URL.trim().replace(/\/+$/, ''));
@@ -160,6 +167,8 @@ const isAllowedOrigin = (origin) => {
   try {
     const parsed = new URL(origin);
     if (parsed.hostname.endsWith('.vercel.app')) return true;
+    if (parsed.hostname.endsWith('.onrender.com')) return true;
+    if (parsed.hostname.endsWith('.railway.app')) return true;
     if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') return true;
   } catch {}
   return false;
@@ -168,13 +177,30 @@ const isAllowedOrigin = (origin) => {
 app.use(cors({
   origin: (origin, callback) => {
     if (isAllowedOrigin(origin)) return callback(null, true);
-    callback(null, false);
+    console.warn(`[CORS] Request blocked from origin: ${origin}`);
+    callback(new Error(`Origin ${origin} not allowed by CORS`));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Cookie', 'X-Requested-With', 'Accept'],
+  exposedHeaders: ['Set-Cookie'],
 }));
 app.use(express.json()); app.use('/uploads', express.static(uploadDir));
+
+// Safe API request logger
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api') || req.path === '/health') {
+    const start = Date.now();
+    res.on('finish', () => {
+      const duration = Date.now() - start;
+      if (res.statusCode >= 400) {
+        console.warn(`[API] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${duration}ms)`);
+      }
+    });
+  }
+  next();
+});
+
 const sessionSecret = process.env.SESSION_SECRET || process.env.EMAIL_VERIFICATION_SECRET || 'bugtrack-pro-persistent-session-secret';
 const sessionLifetimeSeconds = 24 * 60 * 60;
 const parseCookies = (header = '') => Object.fromEntries(header.split(';').filter(Boolean).flatMap(part => {
@@ -205,11 +231,14 @@ const readSession = (value) => {
   }
 };
 const requireAuth = (req, res, next) => {
+  const authHeader = req.headers.authorization || '';
+  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
   const sessionCookie = parseCookies(req.headers.cookie).bugtrack_session || '';
-  const session = readSession(sessionCookie);
+  const token = bearerToken || sessionCookie;
+  const session = readSession(token);
   const user = session && db.data.users.find(candidate => candidate.id === session.userId);
   if (!user) {
-    console.warn('Protected request rejected: invalid or expired session.', req.method, req.originalUrl);
+    console.warn(`[AUTH] Protected request rejected (${req.method} ${req.originalUrl}): invalid or expired session.`);
     return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
   }
   req.user = user;
@@ -221,7 +250,15 @@ app.use((error, req, res, next) => {
   }
   next(error);
 });
-app.get('/api/health', (req, res) => res.json({ status: 'ok', service: 'BugTrack Pro API' }));
+const healthHandler = (req, res) => res.json({
+  status: 'ok',
+  service: 'BugTrack Pro API',
+  database: supabase ? 'supabase' : 'local',
+  emailConfigured: Boolean(process.env.SMTP_HOST && (process.env.SMTP_USER || process.env.SMTP_EMAIL)),
+  timestamp: new Date().toISOString(),
+});
+app.get('/health', healthHandler);
+app.get('/api/health', healthHandler);
 app.post('/api/analyzer/analyze', requireAuth, async (req, res) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60_000);
@@ -408,29 +445,82 @@ const sendVerificationEmail = async (email, code) => {
   const config = smtpConfig();
   const transporter = createSmtpTransporter();
   try {
-    await transporter.sendMail({
-      from: config.from,
+    const info = await transporter.sendMail({
+      from: `"BugTrack Pro" <${config.from}>`,
       to: email,
       subject: 'Verify your BugTrack Pro email',
-      text: `Your BugTrack Pro verification code is ${code}. It expires in ${verificationExpiryMinutes} minutes.`,
+      text: `Your BugTrack Pro verification code is ${code}. It expires in ${verificationExpiryMinutes} minutes.\n\nIf you did not request this code, you can safely ignore this email.`,
+      html: `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 28px 20px; background-color: #ffffff; color: #1e293b; border: 1px solid #e2e8f0; border-radius: 8px;">
+          <div style="margin-bottom: 20px;">
+            <h2 style="margin: 0; color: #0f172a; font-size: 22px;">BugTrack <span style="color: #2563eb;">Pro</span></h2>
+            <p style="margin: 4px 0 0 0; color: #64748b; font-size: 13px;">Software Testing &amp; Bug Management</p>
+          </div>
+          <h3 style="margin: 0 0 12px 0; color: #1e293b; font-size: 17px;">Verify your email address</h3>
+          <p style="margin: 0 0 16px 0; font-size: 14px; line-height: 1.5; color: #334155;">
+            Thank you for registering with BugTrack Pro. Use the verification code below to complete your registration:
+          </p>
+          <div style="font-size: 32px; font-weight: 700; letter-spacing: 6px; color: #2563eb; background-color: #f1f5f9; padding: 16px; text-align: center; border-radius: 6px; margin: 20px 0;">
+            ${code}
+          </div>
+          <p style="margin: 0 0 8px 0; font-size: 13px; color: #64748b;">
+            This code will expire in <strong>${verificationExpiryMinutes} minutes</strong>.
+          </p>
+          <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
+          <p style="margin: 0; font-size: 12px; color: #94a3b8;">
+            If you did not request this account, please disregard this email.
+          </p>
+        </div>
+      `,
     });
+    console.log(`[EMAIL] Verification email sent to ${maskEmail(email)} (MessageID: ${info?.messageId || 'sent'})`);
+    return info;
   } catch (error) {
+    console.error(`[EMAIL] Failed to send verification email to ${maskEmail(email)}:`, error.message);
     throw new SmtpDeliveryError(error);
   }
 };
-const sendPasswordResetEmail = async (email, token) => {
+const sendPasswordResetEmail = async (email, token, baseUrl) => {
   const config = smtpConfig();
   const transporter = createSmtpTransporter();
-  const resetBaseUrl = process.env.APP_URL || 'http://localhost:5173';
+  const resetBaseUrl = baseUrl || process.env.APP_URL || process.env.FRONTEND_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:5173');
   const resetUrl = `${resetBaseUrl.replace(/\/$/, '')}/?resetToken=${encodeURIComponent(token)}`;
   try {
-    await transporter.sendMail({
-      from: config.from,
+    const info = await transporter.sendMail({
+      from: `"BugTrack Pro" <${config.from}>`,
       to: email,
       subject: 'Reset your BugTrack Pro password',
-      text: `Use this link to reset your BugTrack Pro password. It expires in ${passwordResetExpiryMinutes} minutes:\n\n${resetUrl}\n\nIf you did not request this, you can ignore this email.`,
+      text: `You recently requested to reset your password for BugTrack Pro.\n\nUse this link to reset your password (expires in ${passwordResetExpiryMinutes} minutes):\n${resetUrl}\n\nIf you did not request a password reset, you can safely ignore this email. Your password will not change.`,
+      html: `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 560px; margin: 0 auto; padding: 32px 24px; background-color: #ffffff; color: #1e293b; border: 1px solid #e2e8f0; border-radius: 8px;">
+          <div style="margin-bottom: 24px;">
+            <h2 style="margin: 0; color: #0f172a; font-size: 22px; font-weight: 700;">BugTrack <span style="color: #2563eb;">Pro</span></h2>
+            <p style="margin: 4px 0 0 0; color: #64748b; font-size: 14px;">Software Testing &amp; Bug Management</p>
+          </div>
+          <h3 style="margin: 0 0 16px 0; color: #1e293b; font-size: 18px;">Reset your password</h3>
+          <p style="margin: 0 0 20px 0; font-size: 15px; line-height: 1.5; color: #334155;">
+            We received a request to reset the password for your BugTrack Pro account (<strong>${maskEmail(email)}</strong>). Click the button below to set a new password:
+          </p>
+          <div style="margin: 28px 0;">
+            <a href="${resetUrl}" style="background-color: #2563eb; color: #ffffff; padding: 12px 28px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 15px; display: inline-block;">Reset Password</a>
+          </div>
+          <p style="margin: 0 0 12px 0; font-size: 13px; color: #64748b; line-height: 1.5;">
+            This link will expire in <strong>${passwordResetExpiryMinutes} minutes</strong>. If the button does not work, copy and paste this link into your browser:
+          </p>
+          <p style="margin: 0 0 24px 0; word-break: break-all; font-size: 13px; color: #2563eb;">
+            <a href="${resetUrl}" style="color: #2563eb;">${resetUrl}</a>
+          </p>
+          <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;" />
+          <p style="margin: 0; font-size: 12px; color: #94a3b8;">
+            If you did not request this password reset, no action is needed. Your account remains secure.
+          </p>
+        </div>
+      `,
     });
+    console.log(`[EMAIL] Password reset email sent to ${maskEmail(email)} (MessageID: ${info?.messageId || 'sent'})`);
+    return info;
   } catch (error) {
+    console.error(`[EMAIL] Failed to send password reset email to ${maskEmail(email)}:`, error.message);
     throw new SmtpDeliveryError(error);
   }
 };
@@ -453,27 +543,60 @@ for (const user of db.data.users) {
   if (user.emailVerified === undefined) user.emailVerified = true;
 }
 await save();
-const loginHandler = (req, res) => {
+const loginHandler = async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (typeof email !== 'string' || !email.trim() || typeof password !== 'string' || !password) {
       return res.status(400).json({ error: 'Enter your email and password.' });
     }
-    const user = db.data.users.find((candidate) => typeof candidate.email === 'string' && candidate.email.toLowerCase() === email.trim().toLowerCase());
+    const normalizedEmail = email.trim().toLowerCase();
+    let user = db.data.users.find((candidate) => typeof candidate.email === 'string' && candidate.email.toLowerCase() === normalizedEmail);
+
+    // If user not found in local cache, unverified, or credentials mismatch, check Supabase Cloud
+    if ((!user || !user.emailVerified || !passwordMatches(password, user.passwordHash)) && supabase) {
+      try {
+        const { data: remoteProfile } = await supabase.from('profiles').select('*').ilike('email', normalizedEmail).maybeSingle();
+        if (remoteProfile && remoteProfile.password_hash && passwordMatches(password, remoteProfile.password_hash)) {
+          if (!user) {
+            user = {
+              id: remoteProfile.id,
+              name: remoteProfile.name,
+              email: remoteProfile.email,
+              role: remoteProfile.role || 'Tester',
+              passwordHash: remoteProfile.password_hash,
+              emailVerified: Boolean(remoteProfile.email_verified),
+              createdAt: remoteProfile.created_at || new Date().toISOString(),
+            };
+            db.data.users.push(user);
+          } else {
+            user.passwordHash = remoteProfile.password_hash;
+            user.emailVerified = Boolean(remoteProfile.email_verified);
+          }
+          await save();
+        }
+      } catch (sbErr) {
+        console.warn('[AUTH] Supabase profile fallback lookup notice:', sbErr.message);
+      }
+    }
+
     if (!user || !passwordMatches(password, user.passwordHash)) {
-      console.warn(`Failed sign-in attempt for ${email.trim().toLowerCase()}`);
+      console.warn(`[AUTH] Failed sign-in attempt for ${maskEmail(normalizedEmail)}`);
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
     if (!user.emailVerified) {
+      console.warn(`[AUTH] Sign-in rejected for unverified account: ${maskEmail(user.email)}`);
       return res.status(403).json({ error: 'Verify your email before signing in.', verificationRequired: true, email: user.email, maskedEmail: maskEmail(user.email) });
     }
     const sessionToken = signSession(user.id);
-    const secure = process.env.VERCEL === '1' ? '; Secure' : '';
-    res.setHeader('Set-Cookie', `bugtrack_session=${encodeURIComponent(sessionToken)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${sessionLifetimeSeconds}${secure}`);
-    res.json({ id: user.id, name: user.name, role: user.role, email: user.email });
+    const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+    const sameSite = isSecure ? 'None' : 'Lax';
+    const secureFlag = isSecure ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `bugtrack_session=${encodeURIComponent(sessionToken)}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=${sessionLifetimeSeconds}${secureFlag}`);
+    console.log(`[AUTH] User signed in successfully: ${maskEmail(user.email)} [${user.role}]`);
+    res.json({ id: user.id, name: user.name, role: user.role, email: user.email, token: sessionToken });
   } catch (error) {
-    console.error('Sign-in failed:', error);
-    res.status(500).json({ error: 'Sign-in is temporarily unavailable. Please restart the application and try again.' });
+    console.error('[AUTH] Sign-in failed with error:', error);
+    res.status(500).json({ error: 'Sign-in is temporarily unavailable. Please try again.' });
   }
 };
 app.post('/api/login', loginHandler);
@@ -491,64 +614,178 @@ const meHandler = (req, res) => {
 };
 app.get('/api/me', requireAuth, meHandler);
 app.get('/api/auth/me', requireAuth, meHandler);
+
 app.post('/api/password-reset/request', async (req, res) => {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
   const genericResponse = { message: 'If an account exists for this email, password reset instructions will be sent.' };
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Enter a valid email address.' });
+  }
+
+  // Determine client origin URL for reset link
+  const clientOrigin = req.get('origin') || (req.get('referer') ? new URL(req.get('referer')).origin : null);
+  const baseUrl = clientOrigin || process.env.APP_URL || process.env.FRONTEND_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:5173');
+
   const nowMs = Date.now();
-  const requestKey = `${req.ip}:${email}`;
+  const requestKey = email;
   const lastRequestAt = passwordResetRequests.get(requestKey) || 0;
-  if (nowMs - lastRequestAt < 60 * 1000) return res.status(200).json(genericResponse);
+  if (nowMs - lastRequestAt < 30 * 1000) {
+    console.log(`[AUTH] Password reset request throttled for ${maskEmail(email)}`);
+    return res.status(200).json(genericResponse);
+  }
   passwordResetRequests.set(requestKey, nowMs);
-  const user = db.data.users.find((candidate) => candidate.email.toLowerCase() === email);
-  if (!user) return res.status(200).json(genericResponse);
+
+  let user = db.data.users.find((candidate) => typeof candidate.email === 'string' && candidate.email.trim().toLowerCase() === email);
+  if (!user && supabase) {
+    try {
+      const { data: remoteProfile } = await supabase.from('profiles').select('*').ilike('email', email).maybeSingle();
+      if (remoteProfile) {
+        user = {
+          id: remoteProfile.id,
+          name: remoteProfile.name,
+          email: remoteProfile.email,
+          role: remoteProfile.role,
+          passwordHash: remoteProfile.password_hash,
+          emailVerified: Boolean(remoteProfile.email_verified),
+          createdAt: remoteProfile.created_at,
+        };
+        db.data.users.push(user);
+        await save();
+      }
+    } catch (sbErr) {
+      console.warn('[AUTH] Supabase check during password reset failed:', sbErr.message);
+    }
+  }
+
+  if (!user) {
+    console.log(`[AUTH] Password reset requested for unregistered email: ${maskEmail(email)}`);
+    return res.status(200).json(genericResponse);
+  }
+
   const token = crypto.randomBytes(32).toString('base64url');
   user.passwordResetTokenHash = hashResetToken(token);
   user.passwordResetExpiresAt = nowMs + passwordResetExpiryMinutes * 60 * 1000;
   await save();
+  await syncProfileToSupabase(user);
+
   try {
-    await sendPasswordResetEmail(user.email, token);
+    const info = await sendPasswordResetEmail(user.email, token, baseUrl);
+    console.log(`[AUTH] Password reset email delivered for ${maskEmail(user.email)} (MessageID: ${info?.messageId || 'sent'})`);
   } catch (error) {
     delete user.passwordResetTokenHash;
     delete user.passwordResetExpiresAt;
     await save();
-    console.error('Password reset email delivery notice:', error.code || error.message);
+    await syncProfileToSupabase(user);
+    console.error(`[AUTH] Password reset email delivery failed for ${maskEmail(user.email)}:`, error.code || error.message);
   }
-  res.status(200).json(genericResponse);
+  return res.status(200).json(genericResponse);
 });
-app.post('/api/password-reset/validate', (req, res) => {
-  const token = typeof req.body?.token === 'string' ? req.body.token : '';
-  const user = db.data.users.find((candidate) => candidate.passwordResetTokenHash === hashResetToken(token));
-  if (!token || !user || !user.passwordResetExpiresAt || Date.now() > user.passwordResetExpiresAt) {
+
+app.post('/api/password-reset/validate', async (req, res) => {
+  const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+  if (!token) return res.status(400).json({ error: 'Reset token is required.' });
+  const tokenHash = hashResetToken(token);
+  let user = db.data.users.find((candidate) => candidate.passwordResetTokenHash === tokenHash);
+  if (!user && supabase) {
+    try {
+      const { data: remoteProfiles } = await supabase.from('profiles').select('*');
+      const remote = remoteProfiles?.find(p => p.extra_data?.passwordResetTokenHash === tokenHash);
+      if (remote) {
+        user = db.data.users.find(u => u.id === remote.id);
+        if (!user) {
+          user = {
+            id: remote.id,
+            name: remote.name,
+            email: remote.email,
+            role: remote.role || 'Tester',
+            passwordHash: remote.password_hash,
+            emailVerified: Boolean(remote.email_verified),
+            createdAt: remote.created_at,
+          };
+          db.data.users.push(user);
+        }
+        user.passwordResetTokenHash = remote.extra_data?.passwordResetTokenHash;
+        user.passwordResetExpiresAt = remote.extra_data?.passwordResetExpiresAt;
+        await save();
+      }
+    } catch (sbLookupErr) {
+      console.warn('[AUTH] Supabase token check notice:', sbLookupErr.message);
+    }
+  }
+  if (!user || !user.passwordResetExpiresAt || Date.now() > user.passwordResetExpiresAt) {
+    console.warn('[AUTH] Password reset token validation rejected: invalid or expired token.');
     return res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
   }
   res.json({ valid: true });
 });
+
 app.post('/api/password-reset/complete', async (req, res) => {
-  const token = typeof req.body?.token === 'string' ? req.body.token : '';
+  const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
-  const user = db.data.users.find((candidate) => candidate.passwordResetTokenHash === hashResetToken(token));
-  if (!token || !user || !user.passwordResetExpiresAt || Date.now() > user.passwordResetExpiresAt) {
+  if (!token) return res.status(400).json({ error: 'Reset token is required.' });
+  const tokenHash = hashResetToken(token);
+  let user = db.data.users.find((candidate) => candidate.passwordResetTokenHash === tokenHash);
+  if (!user && supabase) {
+    try {
+      const { data: remoteProfiles } = await supabase.from('profiles').select('*');
+      const remote = remoteProfiles?.find(p => p.extra_data?.passwordResetTokenHash === tokenHash);
+      if (remote) {
+        user = db.data.users.find(u => u.id === remote.id);
+        if (!user) {
+          user = {
+            id: remote.id,
+            name: remote.name,
+            email: remote.email,
+            role: remote.role || 'Tester',
+            passwordHash: remote.password_hash,
+            emailVerified: Boolean(remote.email_verified),
+            createdAt: remote.created_at,
+          };
+          db.data.users.push(user);
+        }
+        user.passwordResetTokenHash = remote.extra_data?.passwordResetTokenHash;
+        user.passwordResetExpiresAt = remote.extra_data?.passwordResetExpiresAt;
+        await save();
+      }
+    } catch (sbLookupErr) {
+      console.warn('[AUTH] Supabase token check notice:', sbLookupErr.message);
+    }
+  }
+  if (!user || !user.passwordResetExpiresAt || Date.now() > user.passwordResetExpiresAt) {
+    console.warn('[AUTH] Password reset completion rejected: invalid or expired token.');
     return res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
   }
   const passwordError = passwordValidationError(password);
   if (passwordError) return res.status(400).json({ error: passwordError });
+
   user.passwordHash = passwordHash(password);
   delete user.passwordResetTokenHash;
   delete user.passwordResetExpiresAt;
   await save();
-  res.json({ reset: true, message: 'Your password has been reset successfully.' });
+  await syncProfileToSupabase(user);
+  console.log(`[AUTH] Password reset successfully completed for user: ${maskEmail(user.email)}`);
+  res.json({ reset: true, message: 'Your password has been reset successfully. Please sign in with your new password.' });
 });
+
 const registerHandler = async (req, res) => {
   const { name, email, password, role = 'Tester' } = req.body || {};
-  if (!name?.trim() || !email?.trim() || !password) return res.status(400).json({ error: 'Name, email, and password are required.' });
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
+  if (!name?.trim() || !email?.trim() || !password) {
+    return res.status(400).json({ error: 'Name, email, and password are required.' });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Enter a valid email address.' });
+  }
   const passwordError = passwordValidationError(password);
-  if (passwordError) return res.status(400).json({ error: passwordError });
+  if (passwordError) {
+    return res.status(400).json({ error: passwordError });
+  }
   const normalizedEmail = email.trim().toLowerCase();
   if (db.data.users.some((user) => user.email.toLowerCase() === normalizedEmail)) {
+    console.warn(`[AUTH] Registration rejected: duplicate email ${maskEmail(normalizedEmail)}`);
     return res.status(409).json({ error: 'An account with this email already exists.' });
   }
+
+  // Ensure role cannot be elevated to administrative roles
   const safeRole = ['Developer', 'Tester', 'Viewer'].includes(role) ? role : 'Tester';
   const code = createVerificationCode();
   const user = {
@@ -568,20 +805,24 @@ const registerHandler = async (req, res) => {
   db.data.users.push(user);
   await save();
   await syncProfileToSupabase(user);
+
   try {
     await sendVerificationEmail(user.email, code);
     return res.status(202).json({ verificationRequired: true, email: user.email, maskedEmail: maskEmail(user.email), expiresAt: user.verificationExpiresAt });
   } catch (error) {
-    console.error('Verification email delivery notice:', error.code || error.message);
+    console.error('[AUTH] Verification email delivery notice:', error.code || error.message);
     if (process.env.AUTO_VERIFY_IF_NO_SMTP === 'true' || !process.env.SMTP_HOST || error.code === 'SMTP_NOT_CONFIGURED') {
       user.emailVerified = true;
       delete user.verificationCodeHash;
       await save();
       await syncProfileToSupabase(user);
       const sessionToken = signSession(user.id);
-      const secure = process.env.VERCEL === '1' ? '; Secure' : '';
-      res.setHeader('Set-Cookie', `bugtrack_session=${encodeURIComponent(sessionToken)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${sessionLifetimeSeconds}${secure}`);
-      return res.status(201).json({ id: user.id, name: user.name, email: user.email, role: user.role, verificationRequired: false });
+      const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+      const sameSite = isSecure ? 'None' : 'Lax';
+      const secureFlag = isSecure ? '; Secure' : '';
+      res.setHeader('Set-Cookie', `bugtrack_session=${encodeURIComponent(sessionToken)}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=${sessionLifetimeSeconds}${secureFlag}`);
+      console.log(`[AUTH] Auto-verified new registration (no active SMTP): ${maskEmail(user.email)} [${user.role}]`);
+      return res.status(201).json({ id: user.id, name: user.name, email: user.email, role: user.role, verificationRequired: false, token: sessionToken });
     }
     db.data.users = db.data.users.filter((candidate) => candidate !== user);
     await save();
@@ -590,6 +831,7 @@ const registerHandler = async (req, res) => {
 };
 app.post('/api/register', registerHandler);
 app.post('/api/auth/register', registerHandler);
+
 app.post('/api/verify', async (req, res) => {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
   const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
@@ -610,7 +852,15 @@ app.post('/api/verify', async (req, res) => {
   delete user.verificationLastSentAt;
   delete user.verificationResends;
   await save();
-  res.json({ verified: true, message: 'Email verified successfully. Please sign in.' });
+  await syncProfileToSupabase(user);
+
+  const sessionToken = signSession(user.id);
+  const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+  const sameSite = isSecure ? 'None' : 'Lax';
+  const secureFlag = isSecure ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `bugtrack_session=${encodeURIComponent(sessionToken)}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=${sessionLifetimeSeconds}${secureFlag}`);
+  console.log(`[AUTH] User verified email successfully: ${maskEmail(user.email)}`);
+  res.json({ verified: true, message: 'Email verified successfully. Please sign in.', user: { id: user.id, name: user.name, email: user.email, role: user.role, token: sessionToken } });
 });
 app.post('/api/verify/resend', async (req, res) => {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';

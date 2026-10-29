@@ -11,38 +11,88 @@ class ApiError extends Error {
     this.status = status;
   }
 }
-const API_BASE_URL = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
+const getApiBaseUrl = () => {
+  if (typeof window !== 'undefined' && window.__BUGTRACK_API_URL__) {
+    return String(window.__BUGTRACK_API_URL__).trim().replace(/^["']|["']$/g, '').replace(/\/+$/, '');
+  }
+  const envUrl = (import.meta.env.VITE_API_URL || '').trim().replace(/^["']|["']$/g, '').replace(/\/+$/, '');
+  return envUrl;
+};
 const resolveApiUrl = (url) => {
-  if (!url || /^https?:\/\//i.test(url)) return url;
+  if (!url) return '';
+  if (/^https?:\/\//i.test(url)) {
+    if (typeof window !== 'undefined' && window.location.protocol === 'https:' && url.startsWith('http://') && !url.includes('localhost') && !url.includes('127.0.0.1')) {
+      return url.replace('http://', 'https://');
+    }
+    return url;
+  }
   const path = url.startsWith('/') ? url : `/${url}`;
-  return API_BASE_URL ? `${API_BASE_URL}${path}` : path;
+  let base = getApiBaseUrl();
+  if (base && typeof window !== 'undefined' && window.location.protocol === 'https:' && base.startsWith('http://') && !base.includes('localhost') && !base.includes('127.0.0.1')) {
+    base = base.replace('http://', 'https://');
+  }
+  return base ? `${base}${path}` : path;
 };
 const api = async (url, options = {}) => {
   const controller = new AbortController();
   const timeoutMs = options.timeout || 25_000;
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  let response;
   const fullUrl = resolveApiUrl(url);
+
+  const token = typeof localStorage !== 'undefined' ? localStorage.getItem('bugtrack_token') : null;
+  const headers = {
+    ...(options.headers || {}),
+  };
+  if (token && !headers['Authorization'] && !headers['authorization']) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  let response;
   try {
-    response = await fetch(fullUrl, { ...options, credentials: 'include', signal: controller.signal });
+    response = await fetch(fullUrl, {
+      ...options,
+      headers,
+      credentials: 'include',
+      signal: controller.signal,
+    });
   } catch (error) {
-    if (error.name === 'AbortError') throw new Error('The request timed out. Check the server logs and try again.');
-    throw new Error('Cannot connect to the application server. Start the backend and try again.');
+    clearTimeout(timeout);
+    if (error.name === 'AbortError') {
+      throw new Error(`The request to ${fullUrl} timed out after ${timeoutMs / 1000}s. Check the server logs and try again.`);
+    }
+    const targetDesc = fullUrl.startsWith('http') ? fullUrl : `${typeof window !== 'undefined' ? window.location.origin : ''}${fullUrl}`;
+    throw new Error(`Cannot connect to the application server (${targetDesc}). Ensure the backend is running, CORS allows this origin, and VITE_API_URL is configured.`);
   } finally {
     clearTimeout(timeout);
   }
+
   const contentType = response.headers.get('content-type') || '';
   const rawBody = await response.text();
   let body = null;
   if (rawBody && contentType.includes('application/json')) {
-    try { body = JSON.parse(rawBody); } catch { throw new Error(`The server returned an invalid response (${response.status}).`); }
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      throw new Error(`The server at ${fullUrl} returned invalid JSON (HTTP ${response.status}).`);
+    }
+  } else if (rawBody && (rawBody.trim().startsWith('<!DOCTYPE html>') || rawBody.trim().startsWith('<html'))) {
+    if (!response.ok) {
+      throw new ApiError(`Server returned HTTP ${response.status} with an HTML error page. Verify your backend route and deployment.`, response.status);
+    }
+    throw new Error(`API route ${url} returned an HTML page instead of JSON. Ensure your API server is running and handling this route.`);
   }
+
   if (!response.ok) {
-    if (response.status === 401 && sessionExpiredHandler) sessionExpiredHandler();
+    if (response.status === 401 && sessionExpiredHandler && !url.includes('/api/login') && !url.includes('/api/register') && !url.includes('/api/password-reset')) {
+      sessionExpiredHandler();
+    }
     throw new ApiError(body?.error || `Request failed (${response.status}).`, response.status);
   }
+
   if (response.status === 204) return null;
-  if (body === null) throw new Error('The server returned an empty or invalid response.');
+  if (body === null) {
+    throw new Error('The server returned an empty or invalid response.');
+  }
   return body;
 };
 const statuses = ['Open','In Progress','Fixed','Retesting','Closed','Reopened'];
@@ -75,23 +125,33 @@ function Login({ onLogin, notice = '' }) {
   }, [mode, resetToken]);
   const login = async (event) => {
     event.preventDefault();
+    if (loading) return;
     setError('');
     setLoading(true);
     try {
       if (mode === 'forgot') {
+        const trimmedEmail = email.trim();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+          setError('Please enter a valid email address.');
+          return;
+        }
         try {
           const result = await api('/api/password-reset/request', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: email.trim() }),
+            body: JSON.stringify({ email: trimmedEmail }),
           });
           setError(result?.message || 'If an account exists for this email, password reset instructions will be sent.');
-        } catch {
-          setError('If an account exists for this email, password reset instructions will be sent.');
+        } catch (resetErr) {
+          setError(resetErr.message || 'If an account exists for this email, password reset instructions will be sent.');
         }
         return;
       }
       if (mode === 'reset') {
+        if (!resetToken) {
+          setError('No reset token found. Please use the link sent to your email.');
+          return;
+        }
         const unmetRequirements = passwordChecks.filter(check => !check.test(password)).map(check => check.message);
         if (unmetRequirements.length) {
           setError(unmetRequirements.join(' '));
@@ -106,7 +166,7 @@ function Login({ onLogin, notice = '' }) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ token: resetToken, password }),
         });
-        setError(result.message);
+        setError(result.message || 'Your password has been reset successfully.');
         setMode('reset-success');
         setPassword('');
         setConfirmPassword('');
@@ -118,13 +178,27 @@ function Login({ onLogin, notice = '' }) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email: pendingEmail, code }),
         });
-        setMode('login');
-        setPassword('');
-        setCode('');
-        setError(result.message);
+        if (result?.user) {
+          onLogin(result.user);
+        } else {
+          setMode('login');
+          setPassword('');
+          setCode('');
+          setError(result.message || 'Email verified successfully. Please sign in.');
+        }
         return;
       }
       if (mode === 'register') {
+        const trimmedName = name.trim();
+        const trimmedEmail = email.trim();
+        if (!trimmedName) {
+          setError('Please enter your name.');
+          return;
+        }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+          setError('Please enter a valid email address.');
+          return;
+        }
         const unmetRequirements = passwordChecks.filter(check => !check.test(password)).map(check => check.message);
         if (unmetRequirements.length) {
           setError(unmetRequirements.join(' '));
@@ -137,7 +211,7 @@ function Login({ onLogin, notice = '' }) {
         const result = await api('/api/register', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: name.trim(), email: email.trim(), password, role }),
+          body: JSON.stringify({ name: trimmedName, email: trimmedEmail, password, role }),
         });
         if (result?.verificationRequired) {
           setPendingEmail(result.email);
@@ -152,10 +226,16 @@ function Login({ onLogin, notice = '' }) {
         }
         return;
       }
+      // Mode === 'login'
+      const trimmedEmail = email.trim();
+      if (!trimmedEmail || !password) {
+        setError('Enter your email and password.');
+        return;
+      }
       const result = await api('/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim(), password }),
+        body: JSON.stringify({ email: trimmedEmail, password }),
       });
       onLogin(result);
     } catch (authError) {
@@ -165,7 +245,25 @@ function Login({ onLogin, notice = '' }) {
     }
   };
   useEffect(() => { if (notice) setError(notice); }, [notice]);
-  const resend = async () => { setError(''); try { const result = await api('/api/verify/resend', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:pendingEmail}) }); setExpiresAt(result.expiresAt); setCountdown(Math.ceil((result.expiresAt - Date.now()) / 1000)); setError('A new verification code was sent.'); } catch (resendError) { setError(resendError.message); } };
+  const resend = async () => {
+    if (loading) return;
+    setError('');
+    setLoading(true);
+    try {
+      const result = await api('/api/verify/resend', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: pendingEmail }),
+      });
+      setExpiresAt(result.expiresAt);
+      setCountdown(Math.ceil((result.expiresAt - Date.now()) / 1000));
+      setError('A new verification code was sent.');
+    } catch (resendError) {
+      setError(resendError.message);
+    } finally {
+      setLoading(false);
+    }
+  };
   const verificationPage = <><div className="brand-mark"><Bug size={22}/></div><h1>Verify Your Email</h1><p className="muted">We have sent a verification code to your email address.</p><p className="muted">{maskedEmail}</p><label>Six-digit verification code<input value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,'').slice(0,6))} inputMode="numeric" pattern="[0-9]{6}" autoComplete="one-time-code" placeholder="000000" required/></label>{error&&<div className={error.includes('successfully')||error.includes('sent')?'login-success':'login-error'}>{error}</div>}<button className="primary full" disabled={loading||code.length!==6}>{loading?'Verifying...':'Verify Email'}</button><button type="button" className="auth-switch" onClick={resend} disabled={loading||countdown>0}>Resend OTP {countdown>0&&`(${Math.floor(countdown/60)}:${String(countdown%60).padStart(2,'0')})`}</button><button type="button" className="auth-switch" onClick={()=>{setMode('register');setError('')}}>Back to Registration</button></>;
   const registrationPage = <><div className="brand-mark"><Bug size={22}/></div><h1>Create your BugTrack <span>Pro</span></h1><p className="muted">Register your quality workspace account</p><label>Name<input value={name} onChange={e=>setName(e.target.value)} placeholder="Enter your name" autoComplete="name" required/></label><label>Email<input value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com" type="email" autoComplete="email" required/></label><PasswordField label="Password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="At least 8 characters" autoComplete="new-password"/>{password&&<ul className="password-requirements">{passwordChecks.map(check=><li key={check.message} className={check.test(password)?'valid':''}>{check.message}</li>)}</ul>}<PasswordField label="Confirm password" value={confirmPassword} onChange={e=>setConfirmPassword(e.target.value)} placeholder="Repeat your password" autoComplete="new-password"/>{confirmPassword&&<div className={password === confirmPassword ? 'password-match' : 'password-mismatch'}>{password === confirmPassword ? 'Passwords match' : 'Passwords do not match'}</div>}<label>Role<select value={role} onChange={e=>setRole(e.target.value)}><option>Developer</option><option>Tester</option><option>Viewer</option></select></label></>;
   const loginPage = <><div className="brand-mark"><Bug size={22}/></div><h1>Welcome to BugTrack <span>Pro</span></h1><p className="muted">Sign in to your quality workspace</p><label>Email<input value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com" type="email" autoComplete="email" required/></label><PasswordField label="Password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="At least 8 characters" autoComplete="current-password"/><button type="button" className="forgot-link" onClick={()=>{setMode('forgot');setError('')}}>Forgot Password?</button></>;
@@ -182,21 +280,54 @@ function PanelTitle({ title, action, onClick }) { return <div className="panel-t
 function App() {
   const [user,setUser]=useState(null), [authNotice,setAuthNotice]=useState(''), [page,setPage]=useState('Dashboard'), [bugs,setBugs]=useState([]), [summary,setSummary]=useState({}), [cases,setCases]=useState([]), [selected,setSelected]=useState(null), [modal,setModal]=useState(null), [query,setQuery]=useState(''), [status,setStatus]=useState('All'), [severity,setSeverity]=useState('All'), [toast,setToast]=useState('');
   const canEdit=user?.role!=='Viewer';
+
+  useEffect(() => {
+    const savedUser = localStorage.getItem('bugtrack_user');
+    if (savedUser) {
+      try {
+        setUser(JSON.parse(savedUser));
+      } catch {}
+      api('/api/me')
+        .then(currentUser => {
+          setUser(currentUser);
+          localStorage.setItem('bugtrack_user', JSON.stringify(currentUser));
+        })
+        .catch(() => {
+          localStorage.removeItem('bugtrack_user');
+          localStorage.removeItem('bugtrack_token');
+          setUser(null);
+          setAuthNotice('Your session expired. Please sign in again.');
+        });
+    }
+  }, []);
+
   useEffect(() => {
     sessionExpiredHandler = () => {
       setUser(current => {
         if (!current) return current;
+        localStorage.removeItem('bugtrack_user');
+        localStorage.removeItem('bugtrack_token');
         setAuthNotice('Your session expired. Please sign in again.');
         return null;
       });
     };
     return () => { sessionExpiredHandler = null; };
   }, []);
+
+  const handleLogin = (userData) => {
+    if (userData?.token) {
+      localStorage.setItem('bugtrack_token', userData.token);
+    }
+    localStorage.setItem('bugtrack_user', JSON.stringify(userData));
+    setUser(userData);
+    setAuthNotice('');
+  };
+
   const refresh=async()=>{try{const p=new URLSearchParams({search:query,status,severity});const [b,s,c]=await Promise.all([api(`/api/bugs?${p}`),api('/api/summary'),api('/api/test-cases')]);setBugs(b);setSummary(s);setCases(c)}catch(e){if(e.status !== 401)setToast(e.message)}};
   useEffect(()=>{if(user) refresh()},[user,query,status,severity]);
   const notify=m=>{setToast(m);setTimeout(()=>setToast(''),2500)};
-  if(!user)return <Login onLogin={userData=>{setAuthNotice('');setUser(userData)}} notice={authNotice}/>;
-  const logout=async()=>{try{await api('/api/logout',{method:'POST'})}finally{setUser(null);setAuthNotice('');setBugs([]);setCases([]);setSummary({});setSelected(null);setPage('Dashboard')}};
+  if(!user)return <Login onLogin={handleLogin} notice={authNotice}/>;
+  const logout=async()=>{try{await api('/api/logout',{method:'POST'})}finally{localStorage.removeItem('bugtrack_user');localStorage.removeItem('bugtrack_token');setUser(null);setAuthNotice('');setBugs([]);setCases([]);setSummary({});setSelected(null);setPage('Dashboard')}};
   const saveBug=async(data,file)=>{try{const required=['title','description','module','severity','priority','status','assignee'];const missing=required.find(key=>!String(data[key]||'').trim());if(missing)throw new Error(`Please complete the ${missing} field.`);let payload={...data};if(file){const form=new FormData();form.append('file',file);const uploaded=await api('/api/uploads',{method:'POST',body:form});payload.screenshot=uploaded.url}await api(data.id?`/api/bugs/${data.id}`:'/api/bugs',{method:data.id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});setModal(null);await refresh();notify(data.id?'Bug updated':'Bug created')}catch(e){notify(e.message)}};
   const moveBug=async(id,status)=>{try{const updated=await api(`/api/bugs/${id}/workflow`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,actor:user.name})});setSelected(updated);refresh();notify(`Bug moved to ${status}`)}catch(e){notify(e.message)}};
   const removeBug=async(id)=>{if(!confirm('Delete this bug report?'))return;await api(`/api/bugs/${id}`,{method:'DELETE'});setSelected(null);refresh();notify('Bug deleted')};

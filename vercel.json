@@ -1,41 +1,21 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "services": {
-    "app": {
-      "root": ".",
-      "framework": "vite"
-    },
-    "api": {
-      "root": ".",
-      "framework": "express",
-      "entrypoint": "api/index.js",
-      "bindings": [
-        {
-          "type": "service",
-          "service": "analyzer",
-          "format": "url",
-          "env": "ANALYZER_URL"
-        }
-      ]
-    },
-    "analyzer": {
-      "root": "backend",
-      "framework": "flask",
-      "entrypoint": "app.py"
-    }
-  },
   "rewrites": [
     {
+      "source": "/health",
+      "destination": "/api/index.js"
+    },
+    {
       "source": "/api/(.*)",
-      "destination": {
-        "service": "api"
-      }
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/uploads/(.*)",
+      "destination": "/api/index.js"
     },
     {
       "source": "/(.*)",
-      "destination": {
-        "service": "app"
-      }
+      "destination": "/index.html"
     }
   ]
 }
