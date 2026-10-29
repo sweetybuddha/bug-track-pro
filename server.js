@@ -144,7 +144,7 @@ const deleteTestCaseFromSupabase = async (caseId) => {
 };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const runtimeDataDir = process.env.VERCEL === '1' ? path.join(os.tmpdir(), 'bugtrack-pro') : __dirname;
+const runtimeDataDir = process.env.DATA_DIR || __dirname;
 fs.mkdirSync(runtimeDataDir, { recursive: true });
 const app = express();
 app.set('trust proxy', 1);
@@ -158,7 +158,6 @@ const trustedOrigins = new Set((process.env.CORS_ORIGINS || 'http://localhost:51
 
 if (process.env.APP_URL) trustedOrigins.add(process.env.APP_URL.trim().replace(/\/+$/, ''));
 if (process.env.FRONTEND_URL) trustedOrigins.add(process.env.FRONTEND_URL.trim().replace(/\/+$/, ''));
-if (process.env.VERCEL_URL) trustedOrigins.add(`https://${process.env.VERCEL_URL.trim().replace(/\/+$/, '')}`);
 
 const isAllowedOrigin = (origin) => {
   if (!origin) return true;
@@ -523,7 +522,7 @@ const resolveResetBaseUrl = (req) => {
 
   // Trusted environment defaults (prevents host-header/reset-poisoning attacks)
   if (process.env.NODE_ENV === 'production') {
-    return process.env.FRONTEND_URL || process.env.APP_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://bug-track-pro.onrender.com');
+    return process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5173';
   }
   return process.env.FRONTEND_URL || 'http://localhost:5173';
 };
@@ -704,7 +703,7 @@ const loginHandler = async (req, res) => {
       return res.status(403).json({ error: 'Verify your email before signing in.', verificationRequired: true, email: user.email, maskedEmail: maskEmail(user.email) });
     }
     const sessionToken = signSession(user.id);
-    const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+    const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production';
     const sameSite = isSecure ? 'None' : 'Lax';
     const secureFlag = isSecure ? '; Secure' : '';
     res.setHeader('Set-Cookie', `bugtrack_session=${encodeURIComponent(sessionToken)}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=${sessionLifetimeSeconds}${secureFlag}`);
@@ -936,7 +935,7 @@ const registerHandler = async (req, res) => {
     await save();
     await syncProfileToSupabase(user);
     const sessionToken = signSession(user.id);
-    const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+    const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production';
     const sameSite = isSecure ? 'None' : 'Lax';
     const secureFlag = isSecure ? '; Secure' : '';
     res.setHeader('Set-Cookie', `bugtrack_session=${encodeURIComponent(sessionToken)}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=${sessionLifetimeSeconds}${secureFlag}`);
@@ -978,7 +977,7 @@ app.post('/api/verify', async (req, res) => {
   await syncProfileToSupabase(user);
 
   const sessionToken = signSession(user.id);
-  const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+  const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production';
   const sameSite = isSecure ? 'None' : 'Lax';
   const secureFlag = isSecure ? '; Secure' : '';
   res.setHeader('Set-Cookie', `bugtrack_session=${encodeURIComponent(sessionToken)}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=${sessionLifetimeSeconds}${secureFlag}`);
@@ -1120,8 +1119,6 @@ app.post('/api/uploads',requireAuth,upload.single('file'),(req,res)=>{if(!req.fi
 app.get('/api/export',requireAuth,(req,res)=>{const rows=db.data.bugs.filter(b=>b.user_id===req.user.id).map(b=>[b.bug_key,b.title,b.module,b.severity,b.priority,b.status,b.assignee,b.created_at].map(v=>`"${String(v).replaceAll('"','""')}"`).join(','));res.type('text/csv').set('Content-Disposition','attachment; filename="bugtrack-report.csv"').send(['Bug ID,Title,Module,Severity,Priority,Status,Assignee,Created',...rows].join('\n'))});
 app.use(express.static(path.join(__dirname,'dist'))); app.get('*',(_,res)=>res.sendFile(path.join(__dirname,'dist','index.html')));
 const port = Number(process.env.PORT || 3000);
-if (process.env.VERCEL !== '1') {
-  app.listen(port,()=>console.log(`BugTrack Pro API running on port ${port}`));
-}
+app.listen(port, () => console.log(`BugTrack Pro API running on port ${port}`));
 
 export default app;

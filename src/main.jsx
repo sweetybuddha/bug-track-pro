@@ -17,7 +17,6 @@ const getApiBaseUrl = () => {
   }
   const envUrl = (import.meta.env.VITE_API_URL || '').trim().replace(/^["']|["']$/g, '').replace(/\/+$/, '');
 
-  // Auto-connect handling
   if (typeof window !== 'undefined') {
     const host = window.location.hostname;
     // On localhost, prioritize local backend (via Vite proxy or local URL)
@@ -26,13 +25,6 @@ const getApiBaseUrl = () => {
         return envUrl;
       }
       return '';
-    }
-
-    if (envUrl) return envUrl;
-
-    // Auto-connect to your live Render backend when running on Vercel or other cloud frontends
-    if (host.endsWith('.vercel.app') || host.endsWith('.netlify.app') || host.endsWith('.github.io')) {
-      return 'https://bug-track-pro.onrender.com';
     }
   }
   return envUrl;
