@@ -366,21 +366,27 @@ for (const collection of [db.data.bugs, db.data.test_cases, db.data.activity, db
   }
 }
 const verificationExpiryMinutes = Math.max(1, Number(process.env.EMAIL_VERIFICATION_EXPIRY_MINUTES || 10));
-const verificationPepper = process.env.EMAIL_VERIFICATION_SECRET || crypto.randomBytes(32).toString('hex');
-const passwordResetExpiryMinutes = Math.min(30, Math.max(15, Number(process.env.PASSWORD_RESET_EXPIRY_MINUTES || 20)));
+const verificationPepper = (
+  process.env.EMAIL_VERIFICATION_SECRET ||
+  process.env.SESSION_SECRET ||
+  'bugtrack-pro-static-secure-pepper-v1-production-salt'
+).trim();
+const passwordResetExpiryMinutes = Math.min(60, Math.max(5, Number(process.env.PASSWORD_RESET_EXPIRY_MINUTES || 20)));
 const passwordResetRequests = new Map();
 class SmtpConfigurationError extends Error {
   constructor(message) {
     super(message);
     this.name = 'SmtpConfigurationError';
-    this.code = 'SMTP_NOT_CONFIGURED';
+    this.code = 'SMTP_CONFIG_ERROR';
+    this.stage = 'configuration';
   }
 }
 class SmtpDeliveryError extends Error {
-  constructor(cause) {
-    super('The SMTP server could not deliver the email.');
+  constructor(cause, stage = 'delivery') {
+    super(cause?.message || 'The SMTP server could not deliver the email.');
     this.name = 'SmtpDeliveryError';
-    this.code = 'SMTP_DELIVERY_FAILED';
+    this.code = cause?.code || 'SMTP_DELIVERY_FAILED';
+    this.stage = stage;
     this.cause = cause;
   }
 }
@@ -390,9 +396,9 @@ const smtpConfig = () => {
   const user = (process.env.SMTP_USER || process.env.SMTP_EMAIL)?.trim();
   const password = process.env.SMTP_PASSWORD;
   const from = (process.env.SMTP_FROM_EMAIL || process.env.SMTP_EMAIL || user)?.trim();
-  const secure = String(process.env.SMTP_SECURE || (port === 465)).toLowerCase() === 'true';
+  const secure = String(process.env.SMTP_SECURE ?? (port === 465)).toLowerCase() === 'true';
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535 || !user || !password || !from) {
-    throw new SmtpConfigurationError('Email delivery is not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and SMTP_FROM_EMAIL.');
+    throw new SmtpConfigurationError('Email delivery is not configured. Missing required settings: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and SMTP_FROM_EMAIL.');
   }
   return { host, port, secure, user, password, from };
 };
@@ -403,17 +409,19 @@ const createSmtpTransporter = () => {
     port: config.port,
     secure: config.secure,
     auth: { user: config.user, pass: config.password },
-    connectionTimeout: 5000,
-    greetingTimeout: 5000,
-    socketTimeout: 8000,
+    connectionTimeout: 8000,
+    greetingTimeout: 8000,
+    socketTimeout: 10000,
   });
 };
-const sendMailSafe = async (transporter, mailOptions, timeoutMs = 6000) => {
+const sendMailSafe = async (transporter, mailOptions, timeoutMs = 8000) => {
   return Promise.race([
     transporter.sendMail(mailOptions),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`SMTP email delivery timed out after ${timeoutMs / 1000}s`)), timeoutMs)
-    ),
+    new Promise((_, reject) => {
+      const err = new Error(`SMTP email delivery timed out after ${timeoutMs / 1000}s`);
+      err.code = 'ETIMEDOUT';
+      setTimeout(() => reject(err), timeoutMs);
+    }),
   ]);
 };
 const hashOtp = (email, otp) => crypto.createHash('sha256').update(`${verificationPepper}:${email}:${otp}`).digest('hex');
@@ -491,14 +499,100 @@ const sendVerificationEmail = async (email, code) => {
     throw new SmtpDeliveryError(error);
   }
 };
+const resolveResetBaseUrl = (req) => {
+  let origin = null;
+  const reqOrigin = req.get('origin');
+  if (reqOrigin) {
+    origin = reqOrigin.trim();
+  } else {
+    const referer = req.get('referer');
+    if (referer) {
+      try { origin = new URL(referer).origin; } catch {}
+    }
+  }
+
+  // Check if client origin is in allowed origins
+  if (origin && isAllowedOrigin(origin)) {
+    // If request originated from localhost development
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+      return origin;
+    }
+    // In production, prioritize FRONTEND_URL or APP_URL if configured, or use the allowed cloud origin
+    return process.env.FRONTEND_URL || process.env.APP_URL || origin;
+  }
+
+  // Trusted environment defaults (prevents host-header/reset-poisoning attacks)
+  if (process.env.NODE_ENV === 'production') {
+    return process.env.FRONTEND_URL || process.env.APP_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://bug-track-pro.onrender.com');
+  }
+  return process.env.FRONTEND_URL || 'http://localhost:5173';
+};
+
 const sendPasswordResetEmail = async (email, token, baseUrl) => {
+  const resetUrl = `${baseUrl.replace(/\/$/, '')}/?resetToken=${encodeURIComponent(token)}`;
+
+  // 1. Optional: If Resend API key is configured (HTTPS port 443, works seamlessly on Render free tier)
+  if (process.env.RESEND_API_KEY?.trim()) {
+    try {
+      console.log(`[EMAIL] Attempting delivery to ${maskEmail(email)} via Resend API (port 443)...`);
+      const fromAddr = process.env.SMTP_FROM_EMAIL || process.env.SMTP_EMAIL || 'onboarding@resend.dev';
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.RESEND_API_KEY.trim()}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: fromAddr.includes('<') ? fromAddr : `BugTrack Pro <${fromAddr}>`,
+          to: [email],
+          subject: 'Reset your BugTrack Pro password',
+          text: `You recently requested to reset your password for BugTrack Pro.\n\nUse this link to reset your password (expires in ${passwordResetExpiryMinutes} minutes):\n${resetUrl}\n\nIf you did not request a password reset, you can safely ignore this email. Your password will not change.`,
+          html: `
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 560px; margin: 0 auto; padding: 32px 24px; background-color: #ffffff; color: #1e293b; border: 1px solid #e2e8f0; border-radius: 8px;">
+              <div style="margin-bottom: 24px;">
+                <h2 style="margin: 0; color: #0f172a; font-size: 22px; font-weight: 700;">BugTrack <span style="color: #2563eb;">Pro</span></h2>
+                <p style="margin: 4px 0 0 0; color: #64748b; font-size: 14px;">Software Testing &amp; Bug Management</p>
+              </div>
+              <h3 style="margin: 0 0 16px 0; color: #1e293b; font-size: 18px;">Reset your password</h3>
+              <p style="margin: 0 0 20px 0; font-size: 15px; line-height: 1.5; color: #334155;">
+                We received a request to reset the password for your BugTrack Pro account (<strong>${maskEmail(email)}</strong>). Click the button below to set a new password:
+              </p>
+              <div style="margin: 28px 0;">
+                <a href="${resetUrl}" style="background-color: #2563eb; color: #ffffff; padding: 12px 28px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 15px; display: inline-block;">Reset Password</a>
+              </div>
+              <p style="margin: 0 0 12px 0; font-size: 13px; color: #64748b; line-height: 1.5;">
+                This link will expire in <strong>${passwordResetExpiryMinutes} minutes</strong>. If the button does not work, copy and paste this link into your browser:
+              </p>
+              <p style="margin: 0 0 24px 0; word-break: break-all; font-size: 13px; color: #2563eb;">
+                <a href="${resetUrl}" style="color: #2563eb;">${resetUrl}</a>
+              </p>
+              <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;" />
+              <p style="margin: 0; font-size: 12px; color: #94a3b8;">
+                If you did not request this password reset, no action is needed. Your account remains secure.
+              </p>
+            </div>
+          `,
+        }),
+      });
+      if (res.ok) {
+        const resData = await res.json();
+        console.log(`[EMAIL] Password reset email confirmed by Resend for ${maskEmail(email)} (ID: ${resData.id})`);
+        return { messageId: resData.id };
+      }
+      const errText = await res.text();
+      console.warn(`[EMAIL] Resend returned ${res.status}, falling back to SMTP: ${errText}`);
+    } catch (apiErr) {
+      console.warn(`[EMAIL] Resend API error, falling back to SMTP: ${apiErr.message}`);
+    }
+  }
+
+  // 2. Standard SMTP Delivery
   const config = smtpConfig();
   const transporter = createSmtpTransporter();
-  const resetBaseUrl = baseUrl || process.env.APP_URL || process.env.FRONTEND_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:5173');
-  const resetUrl = `${resetBaseUrl.replace(/\/$/, '')}/?resetToken=${encodeURIComponent(token)}`;
   try {
     const info = await sendMailSafe(transporter, {
       from: `"BugTrack Pro" <${config.from}>`,
+      replyTo: config.from,
       to: email,
       subject: 'Reset your BugTrack Pro password',
       text: `You recently requested to reset your password for BugTrack Pro.\n\nUse this link to reset your password (expires in ${passwordResetExpiryMinutes} minutes):\n${resetUrl}\n\nIf you did not request a password reset, you can safely ignore this email. Your password will not change.`,
@@ -528,11 +622,22 @@ const sendPasswordResetEmail = async (email, token, baseUrl) => {
         </div>
       `,
     });
-    console.log(`[EMAIL] Password reset email sent to ${maskEmail(email)} (MessageID: ${info?.messageId || 'sent'})`);
-    return info;
+    if (info && (info.messageId || info.accepted?.length > 0)) {
+      console.log(`[EMAIL] Password reset email confirmed by SMTP for ${maskEmail(email)} (MessageID: ${info?.messageId || 'sent'})`);
+      return info;
+    }
+    throw new Error('SMTP transport did not confirm message acceptance.');
   } catch (error) {
-    console.error(`[EMAIL] Failed to send password reset email to ${maskEmail(email)}:`, error.message);
-    throw new SmtpDeliveryError(error);
+    if (error.code === 'ETIMEDOUT' || error.message?.includes('timed out')) {
+      console.error(`[EMAIL] SMTP connection timed out for ${maskEmail(email)}. Note: On Render free tier, outbound SMTP ports (25, 465, 587) are blocked. Use a paid plan or set RESEND_API_KEY.`);
+      throw new SmtpDeliveryError(error, 'timeout');
+    }
+    if (error.code === 'EAUTH' || error.responseCode === 535) {
+      console.error(`[EMAIL] SMTP authentication failed for ${config.user}. Verify your Google App Password / SMTP credentials.`);
+      throw new SmtpDeliveryError(error, 'auth');
+    }
+    console.error(`[EMAIL] Failed to send password reset email to ${maskEmail(email)}: [${error.code || 'UNKNOWN'}] ${error.message}`);
+    throw new SmtpDeliveryError(error, 'delivery');
   }
 };
 if (db.data.bugs.some((bug) => bug.is_demo) || db.data.test_cases.some((testCase) => testCase.is_demo)) {
@@ -634,13 +739,12 @@ app.post('/api/password-reset/request', async (req, res) => {
   }
 
   // Determine client origin URL for reset link
-  const clientOrigin = req.get('origin') || (req.get('referer') ? new URL(req.get('referer')).origin : null);
-  const baseUrl = clientOrigin || process.env.APP_URL || process.env.FRONTEND_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:5173');
+  const baseUrl = resolveResetBaseUrl(req);
 
   const nowMs = Date.now();
   const requestKey = email;
   const lastRequestAt = passwordResetRequests.get(requestKey) || 0;
-  if (nowMs - lastRequestAt < 30 * 1000) {
+  if (nowMs - lastRequestAt < 15 * 1000) {
     console.log(`[AUTH] Password reset request throttled for ${maskEmail(email)}`);
     return res.status(200).json(genericResponse);
   }
@@ -682,14 +786,17 @@ app.post('/api/password-reset/request', async (req, res) => {
   try {
     const info = await sendPasswordResetEmail(user.email, token, baseUrl);
     console.log(`[AUTH] Password reset email delivered for ${maskEmail(user.email)} (MessageID: ${info?.messageId || 'sent'})`);
+    return res.status(200).json(genericResponse);
   } catch (error) {
     delete user.passwordResetTokenHash;
     delete user.passwordResetExpiresAt;
     await save();
     await syncProfileToSupabase(user);
-    console.error(`[AUTH] Password reset email delivery failed for ${maskEmail(user.email)}:`, error.code || error.message);
+    console.error(`[AUTH] Password reset email delivery failed for ${maskEmail(user.email)} stage=${error.stage || 'unknown'}: [${error.code || 'FAIL'}] ${error.message}`);
+    return res.status(503).json({
+      error: 'Unable to send password reset email at this time. Please check mail service configuration or try again later.'
+    });
   }
-  return res.status(200).json(genericResponse);
 });
 
 app.post('/api/password-reset/validate', async (req, res) => {

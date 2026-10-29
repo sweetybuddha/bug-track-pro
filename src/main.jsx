@@ -16,16 +16,26 @@ const getApiBaseUrl = () => {
     return String(window.__BUGTRACK_API_URL__).trim().replace(/^["']|["']$/g, '').replace(/\/+$/, '');
   }
   const envUrl = (import.meta.env.VITE_API_URL || '').trim().replace(/^["']|["']$/g, '').replace(/\/+$/, '');
-  if (envUrl) return envUrl;
 
-  // Auto-connect to your live Render backend when running on Vercel or other cloud frontends
+  // Auto-connect handling
   if (typeof window !== 'undefined') {
     const host = window.location.hostname;
+    // On localhost, prioritize local backend (via Vite proxy or local URL)
+    if (host === 'localhost' || host === '127.0.0.1') {
+      if (envUrl && (envUrl.includes('localhost') || envUrl.includes('127.0.0.1'))) {
+        return envUrl;
+      }
+      return '';
+    }
+
+    if (envUrl) return envUrl;
+
+    // Auto-connect to your live Render backend when running on Vercel or other cloud frontends
     if (host.endsWith('.vercel.app') || host.endsWith('.netlify.app') || host.endsWith('.github.io')) {
       return 'https://bug-track-pro.onrender.com';
     }
   }
-  return '';
+  return envUrl;
 };
 const resolveApiUrl = (url) => {
   if (!url) return '';
@@ -152,7 +162,7 @@ function Login({ onLogin, notice = '' }) {
           });
           setError(result?.message || 'If an account exists for this email, password reset instructions will be sent.');
         } catch (resetErr) {
-          setError(resetErr.message || 'If an account exists for this email, password reset instructions will be sent.');
+          setError(resetErr.message || 'Unable to send password reset email. Please try again later.');
         }
         return;
       }
