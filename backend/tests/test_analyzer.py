@@ -390,3 +390,70 @@ def test_failed_fix_validation():
     eval_val = validate_proposed_fix(still_broken_eval, eval_issue, "Python")
     assert eval_val["is_valid"] is False
     assert "still contains unsafe eval" in eval_val["message"]
+
+
+def test_pathlib_and_constant_division_not_flagged():
+    """Verify that pathlib Path / '.env' and x / 2 are NOT falsely flagged as division by zero."""
+    code = (
+        "from pathlib import Path\n"
+        "ROOT = Path(__file__).resolve().parent\n"
+        "env_path = ROOT / '.env'\n"
+        "sub = env_path / 'config.json'\n"
+        "half = 100 / 2\n"
+        "remainder = 15 % 4\n"
+    )
+    body = analyze_code(code, "Python")
+    titles = [item["title"] for item in body["findings"]]
+    assert "Possible division by zero" not in titles
+    assert "Division by zero" not in titles
+
+
+def test_actual_division_by_zero_and_fix_generation():
+    """Verify that constant division by zero is flagged as Confirmed and fix guards it."""
+    client = app.test_client()
+    an_res = client.post("/api/analyzer/analyze", data={
+        "source": "result = total / 0\n",
+        "source_filename": "calc.py",
+        "language": "Python"
+    }, content_type="multipart/form-data")
+    assert an_res.status_code == 200
+    findings = an_res.get_json()["findings"]
+    div_finding = next(f for f in findings if f["title"] == "Division by zero")
+    assert div_finding["verification"] == "Confirmed"
+
+    fix_res = client.post(f"/api/analyzer/{an_res.get_json()['id']}/fix", json={
+        "issue": div_finding,
+        "source": "result = total / 0\n",
+        "language": "Python"
+    })
+    assert fix_res.status_code == 200
+    fix_body = fix_res.get_json()
+    assert fix_body["is_valid"] is True
+    assert "/ 1" in fix_body["proposed"]
+
+
+def test_javascript_and_html_rule_based_fixes():
+    """Verify rule-based fixes for JavaScript innerHTML and HTML missing alt."""
+    from app import generate_rule_based_fix, validate_proposed_fix
+
+    # JS innerHTML fix
+    js_issue = {
+        "title": "Unsafe HTML injection",
+        "category": "Security",
+        "evidence": "element.innerHTML = userInput;",
+        "original_code": "element.innerHTML = userInput;"
+    }
+    js_proposed, js_expl = generate_rule_based_fix("", js_issue, "JavaScript")
+    assert "element.textContent =" in js_proposed
+    val_js = validate_proposed_fix(js_proposed, js_issue, "JavaScript")
+    assert val_js["is_valid"] is True
+
+    # HTML img alt fix
+    html_issue = {
+        "title": "Image is missing alternative text",
+        "category": "Accessibility",
+        "evidence": '<img src="avatar.png">',
+        "original_code": '<img src="avatar.png">'
+    }
+    html_proposed, html_expl = generate_rule_based_fix("", html_issue, "HTML")
+    assert 'alt="Descriptive label"' in html_proposed

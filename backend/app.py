@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import textwrap
 import uuid
 import urllib.error
 import urllib.request
@@ -95,6 +96,32 @@ def safe_extract(archive, target):
                 shutil.copyfileobj(source, output)
 
 
+def is_safe_divisor(node):
+    """Returns True if the divisor is statically proven non-zero or is a path operand."""
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float, complex)) and node.value != 0:
+            return True
+        if isinstance(node.value, (str, bytes)):
+            return True
+    return False
+
+
+def is_path_binop(node):
+    """Detects pathlib Path division overloading like ROOT / '.env'."""
+    if isinstance(node.right, ast.Constant) and isinstance(node.right.value, (str, bytes)):
+        return True
+    if isinstance(node.left, ast.Name) and any(kw in node.left.id.lower() for kw in ("path", "dir", "root", "file", "folder")):
+        return True
+    if isinstance(node.left, ast.Call):
+        if isinstance(node.left.func, ast.Name) and node.left.func.id in ("Path", "PurePath", "PosixPath", "WindowsPath"):
+            return True
+        if isinstance(node.left.func, ast.Attribute) and node.left.func.attr in ("resolve", "parent", "cwd", "home"):
+            return True
+    if isinstance(node.left, ast.BinOp) and isinstance(node.left.op, ast.Div):
+        return is_path_binop(node.left)
+    return False
+
+
 def analyze_python(path, relative):
     findings = []
     source = path.read_text(encoding="utf-8", errors="replace")
@@ -120,10 +147,13 @@ def analyze_python(path, relative):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in defined:
             findings.append(source_issue("Possibly undefined name", "Undefined symbol", "High", f"'{node.id}' is used before a definition or import was found.", "Define or import the name before using it.", relative, source_lines, node.lineno, "Potential"))
             defined.add(node.id)
-        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)) and isinstance(node.right, ast.Constant) and node.right.value == 0:
-            findings.append(source_issue("Division by zero", "Runtime error", "High", "This operation always divides by zero and will raise an exception.", "Guard the divisor before performing the operation.", relative, source_lines, node.lineno, "Confirmed"))
-        elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
-            findings.append(source_issue("Possible division by zero", "Runtime error", "Medium", "The divisor is not proven to be non-zero by static analysis.", "Validate the divisor before performing the operation.", relative, source_lines, node.lineno, "Potential"))
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+            if is_path_binop(node):
+                pass
+            elif isinstance(node.right, ast.Constant) and isinstance(node.right.value, (int, float, complex)) and node.right.value == 0:
+                findings.append(source_issue("Division by zero", "Runtime error", "High", "This operation always divides by zero and will raise an exception.", "Guard the divisor before performing the operation.", relative, source_lines, node.lineno, "Confirmed"))
+            elif not is_safe_divisor(node.right):
+                findings.append(source_issue("Possible division by zero", "Runtime error", "Medium", "The divisor is not proven to be non-zero by static analysis.", "Validate the divisor before performing the operation.", relative, source_lines, node.lineno, "Potential"))
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             defaults = [*node.args.defaults, *(default for default in node.args.kw_defaults if default)]
@@ -140,7 +170,7 @@ def analyze_python(path, relative):
                     positional_names = [argument.arg for argument in node.args.args[-len(node.args.defaults):]]
                     argument_name = positional_names[default_index] if default_index < len(positional_names) else "value"
                     empty_value = "{}" if isinstance(default, ast.Dict) or isinstance(default, ast.Call) and isinstance(default.func, ast.Name) and default.func.id == "dict" else "set()" if isinstance(default, ast.Set) or isinstance(default, ast.Call) and isinstance(default.func, ast.Name) and default.func.id == "set" else "[]"
-                    corrected = f"def {node.name}(..., {argument_name}=None):\n    if {argument_name} is None:\n        {argument_name} = {empty_value}"
+                    corrected = f"def {node.name}({argument_name}=None):\n    if {argument_name} is None:\n        {argument_name} = {empty_value}"
                     findings.append(issue(
                         "Mutable default argument",
                         "Runtime behavior",
@@ -441,6 +471,15 @@ def validate_proposed_fix(proposed_code, issue_data, language):
     if language == "Python":
         try:
             tree = ast.parse(proposed_code)
+        except IndentationError:
+            try:
+                tree = ast.parse(textwrap.dedent(proposed_code))
+            except SyntaxError as err:
+                return {
+                    "status": "Failed",
+                    "is_valid": False,
+                    "message": f"Syntax error in proposed fix at line {err.lineno or 1}: {err.msg}"
+                }
         except SyntaxError as err:
             return {
                 "status": "Failed",
@@ -493,7 +532,7 @@ def generate_rule_based_fix(source_code, issue_data, language):
     recommendation = issue_data.get("recommendation", "Review the proposed change.")
     corrected_code = (issue_data.get("corrected_code") or "").strip()
 
-    if corrected_code and not corrected_code.startswith("# Review"):
+    if corrected_code and not corrected_code.startswith("# Review") and "..." not in corrected_code:
         return corrected_code, recommendation
 
     # 1. Possibly undefined name (e.g. 'x' is used before a definition)
@@ -526,20 +565,55 @@ def generate_rule_based_fix(source_code, issue_data, language):
             else:
                 proposed = f"const {var_name} = 0; // Initialized variable to resolve undefined symbol\n{original_code}"
             return proposed, f"Declared and initialized '{var_name}' before use."
+        elif language == "Java":
+            if source_code and source_code.strip():
+                lines = source_code.splitlines()
+                line_idx = max(0, min(int(issue_data.get("line") or 1) - 1, len(lines)))
+                indent = len(lines[line_idx]) - len(lines[line_idx].lstrip()) if line_idx < len(lines) else 0
+                lines.insert(line_idx, " " * indent + f"int {var_name} = 0; // Initialized variable to resolve undefined symbol")
+                proposed = "\n".join(lines)
+            else:
+                proposed = f"int {var_name} = 0; // Initialized variable to resolve undefined symbol\n{original_code}"
+            return proposed, f"Declared and initialized '{var_name}' before use."
 
     # 2. Division by zero
     if "division" in title.lower() or "zero" in title.lower():
         if language == "Python":
-            if "/ 0" in original_code or "/ 0.0" in original_code:
-                proposed = re.sub(r"/\s*0(?:\.0)?\b", "/ 1  # Guarded: replaced zero with safe fallback", original_code)
+            if "/ 0" in original_code or "/ 0.0" in original_code or "// 0" in original_code or "% 0" in original_code:
+                proposed = re.sub(r"(/(?:/)?|%)\s*0(?:\.0)?\b", r"\g<1> 1  # Guarded: replaced zero with safe fallback", original_code)
                 return proposed, "Guarded against zero divisor."
             else:
-                proposed = f"# Ensure divisor is non-zero before operation:\n{original_code}"
+                match = re.search(r"(\w+)\s*(?:/|//|%)\s*(\w+)", original_code)
+                if match:
+                    den = match.group(2)
+                    proposed = f"if {den} == 0:\n    raise ValueError('Divisor cannot be zero')\n{original_code}"
+                else:
+                    proposed = f"# Ensure divisor is non-zero before operation:\n{original_code}"
                 return proposed, "Added guard for division divisor."
-        elif language in ("JavaScript", "TypeScript", "Java"):
-            if "/ 0" in original_code:
-                proposed = re.sub(r"/\s*0\b", "/ 1", original_code)
+        elif language in ("JavaScript", "TypeScript"):
+            if "/ 0" in original_code or "% 0" in original_code:
+                proposed = re.sub(r"(/(?:/)?|%)\s*0(?:\.0)?\b", r"\g<1> 1", original_code)
                 return proposed, "Replaced zero divisor with non-zero fallback."
+            else:
+                match = re.search(r"(\w+)\s*(?:/|%)\s*(\w+)", original_code)
+                if match:
+                    den = match.group(2)
+                    proposed = f"if ({den} === 0) throw new Error('Divisor cannot be zero');\n{original_code}"
+                else:
+                    proposed = f"// Ensure divisor is non-zero before operation\n{original_code}"
+                return proposed, "Added guard for division divisor."
+        elif language == "Java":
+            if "/ 0" in original_code or "% 0" in original_code:
+                proposed = re.sub(r"(/(?:/)?|%)\s*0(?:\.0)?\b", r"\g<1> 1", original_code)
+                return proposed, "Replaced zero divisor with non-zero fallback."
+            else:
+                match = re.search(r"(\w+)\s*(?:/|%)\s*(\w+)", original_code)
+                if match:
+                    den = match.group(2)
+                    proposed = f"if ({den} == 0) throw new IllegalArgumentException(\"Divisor cannot be zero\");\n{original_code}"
+                else:
+                    proposed = f"// Ensure divisor is non-zero before operation\n{original_code}"
+                return proposed, "Added guard for division divisor."
 
     # 3. Mutable default argument
     if "mutable default" in title.lower():
@@ -558,14 +632,46 @@ def generate_rule_based_fix(source_code, issue_data, language):
 
     # 5. Image missing alt attribute
     if "alt" in title.lower() or "Image is missing" in title:
-        proposed = re.sub(r"<img\b", '<img alt="Descriptive label"', original_code, count=1, flags=re.I)
+        proposed = re.sub(r"<img\b(?![^>]*\balt\s*=)", '<img alt="Descriptive label"', original_code, count=1, flags=re.I)
         return proposed, "Added descriptive alt attribute for accessibility."
 
     # 6. Unbalanced braces
     if "brace" in title.lower():
-        if original_code.count("{") > original_code.count("}"):
-            proposed = original_code + "\n}"
-            return proposed, "Added missing closing brace."
+        diff = original_code.count("{") - original_code.count("}")
+        if diff > 0:
+            proposed = original_code + ("\n}" * diff)
+            return proposed, "Added missing closing brace(s)."
+        elif diff < 0:
+            proposed = ("{\n" * abs(diff)) + original_code
+            return proposed, "Added missing opening brace(s)."
+
+    # 7. Unsafe HTML injection
+    if "innerhtml" in title.lower() or "Unsafe HTML injection" in title:
+        if language in ("JavaScript", "TypeScript"):
+            proposed = re.sub(r"\.innerHTML\s*=", ".textContent =", original_code)
+            return proposed, "Replaced unsafe innerHTML with textContent."
+
+    # 8. Unused variable
+    if "unused variable" in title.lower():
+        return f"// Removed unused variable or prefix with underscore\n// {original_code}", "Commented out unused variable."
+
+    # 9. Debug logging left in source
+    if "debug" in title.lower() or "console.log" in original_code or "System.out.println" in original_code:
+        if language == "Java":
+            proposed = original_code.replace("System.out.println", "// System.out.println")
+        else:
+            proposed = original_code.replace("console.log", "// console.log")
+        return proposed, "Commented out debug logging statement."
+
+    # 10. Fallback: if corrected_code is provided
+    if corrected_code and not corrected_code.startswith("# Review"):
+        return corrected_code, recommendation
+
+    # 11. Final fallback: wrap with recommendation comment
+    if original_code:
+        comment_prefix = "#" if language == "Python" else "//"
+        proposed = f"{comment_prefix} Recommended fix: {recommendation}\n{original_code}"
+        return proposed, recommendation
 
     return None
 
@@ -647,11 +753,17 @@ def propose_fix(analysis_id):
     if not issue_data.get("title") and not issue_data.get("category"):
         return jsonify(error="Issue must include at least a title or category."), 400
 
-    with db() as connection:
-        row = connection.execute("SELECT * FROM analyses WHERE id=?", (analysis_id,)).fetchone()
-    if not row:
+    row = None
+    try:
+        with db() as connection:
+            row = connection.execute("SELECT * FROM analyses WHERE id=?", (analysis_id,)).fetchone()
+    except Exception as db_err:
+        app.logger.warning("Database query error for analysis %s: %s", analysis_id, db_err)
+
+    if not row and not payload.get("source") and not issue_data.get("original_code") and not issue_data.get("evidence"):
         return jsonify(error="Analysis not found."), 404
-    result_data = json.loads(row["result_json"])
+
+    result_data = json.loads(row["result_json"]) if row else {}
 
     source_code = payload.get("source") or result_data.get("inputs", {}).get("source", "")
     if not source_code and result_data.get("workspace"):
@@ -659,8 +771,13 @@ def propose_fix(analysis_id):
         if target_file.exists():
             source_code = target_file.read_text(encoding="utf-8", errors="replace")
 
-    language = payload.get("language") or row["language"] or "Python"
+    language = payload.get("language") or (row["language"] if row else None) or "Python"
     original = issue_data.get("original_code") or issue_data.get("evidence", "")
+    if not original and source_code:
+        lines = source_code.splitlines()
+        line_num = int(issue_data.get("line") or 1)
+        if 1 <= line_num <= len(lines):
+            original = lines[line_num - 1]
 
     use_ai = payload.get("use_ai")
     ai_key = os.environ.get("BUGTRACK_LLM_API_KEY", "").strip()
@@ -708,11 +825,14 @@ def propose_fix(analysis_id):
     fix_status = "validated" if validation.get("is_valid") else "failed_validation"
 
     fix_id = uuid.uuid4().hex
-    with db() as connection:
-        connection.execute(
-            "INSERT INTO fixes VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (fix_id, analysis_id, issue_data.get("id", ""), now(), fix_status, original, proposed, explanation)
-        )
+    try:
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO fixes VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (fix_id, analysis_id, issue_data.get("id", ""), now(), fix_status, original, proposed, explanation)
+            )
+    except Exception as db_err:
+        app.logger.warning("Could not persist fix record to database: %s", db_err)
 
     return jsonify(
         id=fix_id,

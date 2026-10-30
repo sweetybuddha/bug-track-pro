@@ -1098,22 +1098,52 @@ app.post('/api/analyzer/integrate', requireAuth, async (req, res) => {
   await save(); res.status(201).json({ bugs: createdBugs, test_cases: createdTests, duplicate_count: actionable.length - createdBugs.length });
 });
 app.use('/api/analyzer', requireAuth, async (req, res, next) => {
-  const analysisId = req.path.split('/').filter(Boolean)[0];
-  const analysis = db.data.analyses.find(item => item.id === analysisId && item.user_id === req.user.id);
-  if (!analysis) return res.status(404).json({ error: 'Analysis report not found.' });
+  const segments = req.path.split('/').filter(Boolean);
+  const firstSegment = segments[0];
+
+  if (firstSegment && !['reports', 'fixes', 'analyze', 'integrate'].includes(firstSegment)) {
+    const analysis = db.data.analyses?.find(item =>
+      String(item.id) === String(firstSegment) &&
+      (item.user_id === null || item.user_id === undefined || String(item.user_id) === String(req.user.id))
+    );
+    if (!analysis) return res.status(404).json({ error: 'Analysis report not found.' });
+  }
+
   try {
-    const { host, ...forwardHeaders } = req.headers;
+    const { host, connection, 'content-length': contentLength, ...forwardHeaders } = req.headers;
+    let forwardBody = undefined;
+    if (!['GET', 'HEAD'].includes(req.method)) {
+      if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+        forwardBody = JSON.stringify(req.body);
+        forwardHeaders['content-type'] = 'application/json';
+        forwardHeaders['content-length'] = Buffer.byteLength(forwardBody).toString();
+      } else if (typeof req.body === 'string' && req.body.length > 0) {
+        forwardBody = req.body;
+        forwardHeaders['content-length'] = Buffer.byteLength(forwardBody).toString();
+      } else if (!req.readableEnded) {
+        forwardBody = req;
+      }
+    }
+
     const response = await fetch(analyzerEndpoint(req.originalUrl), {
       method: req.method,
       headers: forwardHeaders,
-      body: ['GET', 'HEAD'].includes(req.method) ? undefined : req,
-      duplex: 'half',
+      body: forwardBody,
+      duplex: forwardBody === req ? 'half' : undefined,
     });
+
     res.status(response.status);
-    response.headers.forEach((value, key) => res.setHeader(key, value));
-    res.send(Buffer.from(await response.arrayBuffer()));
-  } catch {
-    next(new Error('The analyzer service is unavailable.'));
+    response.headers.forEach((value, key) => {
+      const lower = key.toLowerCase();
+      if (!['transfer-encoding', 'content-encoding'].includes(lower)) {
+        res.setHeader(key, value);
+      }
+    });
+    const buffer = Buffer.from(await response.arrayBuffer());
+    res.send(buffer);
+  } catch (err) {
+    console.error(`[Analyzer Proxy Error] ${req.method} ${req.originalUrl}:`, err.message || err);
+    res.status(503).json({ error: 'The analyzer service is unavailable. Please ensure the Python analyzer service is running.' });
   }
 });
 app.get('/api/bugs/:id/comments',requireAuth,(req,res)=>{const bug=db.data.bugs.find(x=>x.id===Number(req.params.id)&&x.user_id===req.user.id);if(!bug)return res.status(404).json({error:'Bug not found.'});res.json(db.data.comments.filter(x=>x.bug_id===bug.id&&x.user_id===req.user.id));});
@@ -1131,6 +1161,17 @@ app.post('/api/test-cases/:id/run',requireAuth,async(req,res)=>{
 });
 app.post('/api/uploads',requireAuth,upload.single('file'),(req,res)=>{if(!req.file)return res.status(400).json({error:'No file uploaded.'});res.json({filename:req.file.originalname,url:`/uploads/${req.file.filename}`})});
 app.get('/api/export',requireAuth,(req,res)=>{const rows=db.data.bugs.filter(b=>b.user_id===req.user.id).map(b=>[b.bug_key,b.title,b.module,b.severity,b.priority,b.status,b.assignee,b.created_at].map(v=>`"${String(v).replaceAll('"','""')}"`).join(','));res.type('text/csv').set('Content-Disposition','attachment; filename="bugtrack-report.csv"').send(['Bug ID,Title,Module,Severity,Priority,Status,Assignee,Created',...rows].join('\n'))});
+
+// Global API error handler ensuring JSON responses instead of HTML error pages
+app.use((err, req, res, next) => {
+  console.error('[API Unhandled Error]', err.message || err);
+  if (res.headersSent) return next(err);
+  if (req.path.startsWith('/api') || req.path === '/health') {
+    return res.status(err.status || 500).json({ error: err.message || 'Internal server error.' });
+  }
+  next(err);
+});
+
 app.use(express.static(path.join(__dirname,'dist'))); app.get('*',(_,res)=>res.sendFile(path.join(__dirname,'dist','index.html')));
 const port = Number(process.env.PORT || 3000);
 app.listen(port, () => console.log(`BugTrack Pro API running on port ${port}`));
