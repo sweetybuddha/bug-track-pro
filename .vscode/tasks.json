@@ -1,0 +1,38 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Start BugTrack Pro (Dev)",
+      "type": "npm",
+      "script": "dev",
+      "isBackground": true,
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "Start Frontend (Vite)",
+      "type": "shell",
+      "command": "npx vite",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Start Backend (Express)",
+      "type": "shell",
+      "command": "node server.js",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Start AI Analyzer (Python)",
+      "type": "shell",
+      "command": "python backend/app.py",
+      "isBackground": true,
+      "problemMatcher": []
+    }
+  ]
+}
+
